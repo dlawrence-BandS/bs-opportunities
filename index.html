@@ -375,9 +375,14 @@ WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTER
 SELECT COUNT(*) AS feed_rows,
   COUNTIF(product_type IS NULL OR TRIM(product_type) = '') AS no_type,
   COUNTIF(RTRIM(link, '/') = 'https://www.barkerandstonehouse.co.uk') AS home_links,
+  COUNTIF(SAFE_CAST(REGEXP_EXTRACT(price, r'[0-9.]+') AS FLOAT64) = 0) AS zero_price,
+  COUNTIF(SAFE_CAST(REGEXP_EXTRACT(sale_price, r'[0-9.]+') AS FLOAT64) > SAFE_CAST(REGEXP_EXTRACT(price, r'[0-9.]+') AS FLOAT64)) AS sale_above,
   (SELECT COUNT(*) FROM ${T('bs_core.dim_product_group')}) AS models
 FROM ${T('google_ads_raw.product_feed')}`,
   feedAge: `SELECT CAST(TIMESTAMP_MILLIS(last_modified_time) AS STRING) AS t FROM ${T('google_ads_raw.__TABLES__')} WHERE table_id = 'product_feed'`,
+  shopSummary: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, impressions, clicks, cost, conversions, conv_value, cost_matched, oos_cost FROM ${T('bs_marts.shopping_summary_28d')}`,
+  shopModels: `SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, impressions, clicks, cost, conversions, conv_value, roas, oos_clicks, oos_cost, store_units, gap_segment FROM ${T('bs_marts.shopping_by_model_28d')} ORDER BY cost DESC LIMIT 3000`,
+  shopGaps: `SELECT product_group_id AS id, product_name AS name, store_units, store_revenue, gap_segment, shopping_impressions FROM ${T('bs_marts.shopping_store_gaps_28d')} ORDER BY store_revenue DESC LIMIT 100`,
   capture: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, ga4_orders, ometria_orders, raw_capture, factor_applied FROM ${T('bs_marts.ga4_capture')}`,
   captureWeekly: `SELECT CAST(wk AS STRING) AS wk, ga4_orders, ometria_orders, capture FROM ${T('bs_marts.ga4_capture_weekly')} ORDER BY wk`,
   mapped: `
@@ -458,7 +463,8 @@ const SEGMENTS = [
 const SEG = Object.fromEntries(SEGMENTS.map(s => [s.key, s]));
 const RULES = {
   PDP_MERCH_REVIEW: 'Product page review', CHECKOUT_STEP_BREAK: 'Checkout step dropped', CHECKOUT_FORM_ERRORS: 'Checkout form errors',
-  HIDDEN_GEM: 'Hidden gem', STORE_BESTSELLER_GAP: 'Store bestseller under-indexing', SEO_CTR: 'Rewrite title and meta', SEO_DROP: 'Organic visibility drop'
+  HIDDEN_GEM: 'Hidden gem', STORE_BESTSELLER_GAP: 'Store bestseller under-indexing',
+  SHOP_WASTED_SPEND: 'Shopping spend with no sales', SHOP_OOS_SPEND: 'Shopping spend on out-of-stock items', SHOP_SCALE: 'Shopping product to scale', SHOP_STORE_NO_ADS: 'Store bestseller missing from Shopping', SEO_CTR: 'Rewrite title and meta', SEO_DROP: 'Organic visibility drop'
 };
 const PLAYBOOK = {
   PDP_MERCH_REVIEW: {
@@ -488,6 +494,26 @@ const PLAYBOOK = {
     why: 'The demand is proven in store, so the gap is the size of the online opportunity.',
     steps: ['Open Store gap and find this product to see which group it is in and why.', 'Follow the steps for that group: add it, make it findable, fix the page or push traffic.'],
     done: 'Its online share of sales moves towards that of similar products.'},
+  SHOP_WASTED_SPEND: {
+    means: 'This product has taken a meaningful amount of Google Shopping spend in the last 28 days without a single sale.',
+    why: 'That spend could go to products that do sell. Often the cause is a price, stock or page problem rather than the ad.',
+    steps: ['Open the product page as a customer: check the price, stock, delivery time and images.', 'Compare the feed price with the page price.', 'If nothing is wrong, exclude the product from Shopping or cut its bid.', 'Move the budget to the products listed under Shopping product to scale.'],
+    done: 'Spend on the product stops or turns into sales within two weeks.'},
+  SHOP_OOS_SPEND: {
+    means: 'Shopping clicks are being paid for on variants the feed shows as out of stock.',
+    why: 'Shoppers who click an out-of-stock item rarely buy, so the spend is wasted and the click is lost.',
+    steps: ['Check the stock status of the variants named.', 'Take them out of Shopping until they are back, or exclude them in the campaign structure.', 'Ask Feedonomics to make sure availability updates daily.'],
+    done: 'Clicks on out-of-stock items fall to near zero.'},
+  SHOP_SCALE: {
+    means: 'This product returns much more per pound of Shopping spend than most, but gets less spend than most.',
+    why: 'More budget on a product that already pays back is the cheapest growth available.',
+    steps: ['Check it is in stock and that the lead time is acceptable.', 'Move it into its own campaign or asset group, or raise its bid.', 'Add about half again to its spend and watch the return for two weeks.', 'Stop raising spend once the return falls towards the average.'],
+    done: 'Revenue from the product rises while the return stays well above average.'},
+  SHOP_STORE_NO_ADS: {
+    means: 'A top seller in our showrooms, live on the website, is hardly appearing in Google Shopping.',
+    why: 'Customers who would buy it online are not seeing it. The cause is usually a feed approval problem or how campaigns are structured.',
+    steps: ['Search for the product in Merchant Center and check for disapprovals or warnings.', 'Check the feed price is not zero and the sale price is valid.', 'Check it falls inside a campaign or asset group that is serving.', 'If all is well, add it to a campaign with its own budget.'],
+    done: 'The product shows impressions and clicks within a week.'},
   SEO_CTR: {
     means: 'This page ranks in the top five for a search but gets far fewer clicks than our own pages do at that position.',
     why: 'Google is already showing us, so a better title and description win clicks without needing a higher ranking.',
@@ -538,6 +564,10 @@ const GUIDE = {
     shows: 'Where visitors drop out between viewing a product and buying, and which checkout forms and coupon codes fail.',
     does: '<ol><li>Look for a sudden step down in either line of the chart.</li><li>Use <b>Form errors</b> to see where it fails.</li><li>Fix failing coupon codes with whoever manages the basket.</li></ol>',
     how: 'GA4 counts each visit once per step reached. Errors come from the site\u2019s error tracking, keeping only form and coupon errors and leaving out browser and third-party script noise.'},
+  shopping: {
+    shows: 'How Google Shopping spend is performing by product, and where it is wasted or missing.',
+    does: '<ol><li>Stop or fix <b>spend with no sales</b>.</li><li>Take <b>out-of-stock</b> items out of Shopping.</li><li>Put more behind products <b>worth scaling</b>.</li><li>Find out why <b>store bestsellers</b> are not showing.</li></ol>',
+    how: 'Google Ads product data for the last 28 days, joined to the feed by product ID and to the store and website data by model. Conversions are Google\u2019s own count, so they differ from GA4 and Ometria.'},
   journeys: {
     shows: 'How long it takes from a customer\u2019s first visit to their order.',
     does: 'Use it to decide how long to judge a campaign or page. If most orders come more than a week after the first visit, same-day sales understate what marketing does.',
@@ -575,7 +605,7 @@ let accessToken = null, tokenExpiry = 0, tokenClient = null;
 const $ = (s, el = document) => el.querySelector(s);
 const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const gbp = n => n == null || isNaN(n) ? '\u2013' : '\u00A3' + Math.round(n).toLocaleString('en-GB');
-const gbpK = n => '\u00A3' + (Math.abs(n) >= 100000 ? Math.round(n / 1000) : (n / 1000).toFixed(1).replace(/\.0$/, '')) + 'k';
+const gbpK = n => Math.abs(n) < 1000 ? '\u00A3' + Math.round(n) : '\u00A3' + (Math.abs(n) >= 100000 ? Math.round(n / 1000) : (n / 1000).toFixed(1).replace(/\.0$/, '')) + 'k';
 const int = n => n == null || isNaN(n) ? '\u2013' : Math.round(n).toLocaleString('en-GB');
 const pct = (n, d = 1) => n == null || isNaN(n) ? '\u2013' : (100 * n).toFixed(d) + '%';
 const dmy = s => { const d = parse(s); return d ? d.toLocaleDateString('en-GB', {day:'numeric', month:'short', year:'numeric', timeZone:'UTC'}) : '\u2013'; };
@@ -781,7 +811,7 @@ function loadDemo(){
 }
 
 /* ---------- shell ---------- */
-const GROUPS = [['Start', ['overview', 'actions']], ['Products', ['opps', 'products', 'lists', 'search']], ['Traffic', ['seo', 'landing']], ['Customers', ['checkout', 'journeys']], ['System', ['health', 'guide']]];
+const GROUPS = [['Start', ['overview', 'actions']], ['Products', ['opps', 'products', 'lists', 'search']], ['Traffic', ['seo', 'landing', 'shopping']], ['Customers', ['checkout', 'journeys']], ['System', ['health', 'guide']]];
 const TAB_ORDER = GROUPS.flatMap(g => g[1]);
 const TABS = {
   overview: {label: 'Overview'},
@@ -791,6 +821,7 @@ const TABS = {
   lists:    {label: 'Product lists',  load: loadLists,    render: renderLists,    needs: '01_build_europe-west2.sql'},
   search:   {label: 'Site search',    load: loadSearch,   render: renderSearch,   needs: '01_build_europe-west2.sql'},
   seo:      {label: 'Organic search', load: loadSeo,      render: renderSeo,      needs: '02_build_eu_search-console.sql'},
+  shopping: {label: 'Shopping',       load: loadShopping, render: renderShopping, needs: '01_build_europe-west2.sql'},
   landing:  {label: 'Landing pages',  load: loadLanding,  render: renderLanding,  needs: '01_build_europe-west2.sql'},
   checkout: {label: 'Checkout',       load: loadCheckout, render: renderCheckout, needs: '01_build_europe-west2.sql'},
   journeys: {label: 'Journeys',       load: loadJourneys, render: renderJourneys, needs: '01_build_europe-west2.sql'},
@@ -1184,6 +1215,33 @@ function renderSeo(el, d){
     options: {responsive: true, maintainAspectRatio: false, scales: {x: {stacked: true, grid: {display: false}}, y: {stacked: true, grid: {color: '#e8e5e0'}}}, plugins: {legend: {position: 'bottom', labels: {boxWidth: 12, boxHeight: 12}}}}});
 }
 
+/* ---------- shopping ---------- */
+async function loadShopping(){
+  const rs = await Promise.all([bq(SQL.shopSummary), bq(SQL.shopModels), bq(SQL.shopGaps)]);
+  return {sum: rs[0][0] || null, models: rs[1], gaps: rs[2]};
+}
+function renderShopping(el, d){
+  const sm = d.sum, rows = d.models;
+  const link = r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name || r.id) + '</a>' : esc(r.name || r.id)) + '<small>' + esc(r.id) + '</small>';
+  const wasted = rows.filter(r => r.cost >= 100 && r.conv_value === 0).sort((a, b) => b.cost - a.cost);
+  const oos = rows.filter(r => r.oos_cost >= 30).sort((a, b) => b.oos_cost - a.oos_cost);
+  const pool = rows.filter(r => r.conversions >= 3 && r.cost >= 100), medRoas = median(pool.map(r => r.roas)), medCost = median(pool.map(r => r.cost));
+  const scale = pool.filter(r => medRoas != null && r.roas >= 1.5 * medRoas && r.cost <= medCost).sort((a, b) => b.conv_value - a.conv_value);
+  const sum = a => a.reduce((t, r) => t + r, 0);
+  const roas = sm && sm.cost ? sm.conv_value / sm.cost : null;
+  el.innerHTML = lede(sm ? gbpK(sm.cost) + ' spent on Google Shopping returned ' + gbpK(sm.conv_value) + (roas ? ' (' + roas.toFixed(1) + 'x).' : '.') : 'Google Shopping by product.',
+      sm ? int(sm.clicks) + ' clicks and ' + int(sm.conversions) + ' conversions from ' + dmy(sm.ws) + ' to ' + dmy(sm.we) + '. These are Google\u2019s own conversions, so they will not match GA4 or Ometria exactly.' : '') +
+    sec('Spend with no sales', gbpK(sum(wasted.map(r => r.cost))) + ' across ' + wasted.length + ' ' + plural(wasted.length, 'product', 'products') + ' that took at least \u00A3100 and sold nothing. Check the price, stock and page first, then exclude or cut the bid.',
+      tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend', num: true, get: r => '<span class="money">' + gbp(r.cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.clicks)}, {label: 'Impressions', num: true, get: r => int(r.impressions)}, {label: 'Sold in store', num: true, title: 'Units over the store sales period', get: r => r.store_units == null ? '\u2013' : int(r.store_units)}], wasted, {limit: 15, empty: 'No product has taken \u00A3100 without a sale.'})) +
+    sec('Spend on out-of-stock items', gbpK(sum(oos.map(r => r.oos_cost))) + ' of clicks on items the feed shows as out of stock. Take them out of Shopping until they are back.',
+      tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend on out-of-stock', num: true, get: r => '<span class="money">' + gbp(r.oos_cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.oos_clicks)}, {label: 'Total spend', num: true, get: r => gbp(r.cost)}], oos, {limit: 15, empty: 'Almost no spend goes to out-of-stock items.'})) +
+    sec('Worth scaling', 'Products that return at least one and a half times the typical return on a below-typical spend' + (medRoas ? ' (typical return ' + medRoas.toFixed(1) + 'x). Raise their bid or give them their own budget.' : '.'),
+      tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Return', num: true, title: 'Revenue per pound of spend', get: r => r.roas.toFixed(1) + 'x'}, {label: 'Spend', num: true, get: r => gbp(r.cost)}, {label: 'Revenue', num: true, get: r => gbp(r.conv_value)}, {label: 'Conversions', num: true, get: r => int(r.conversions)}], scale, {limit: 15, empty: 'No product stands out on return yet.'})) +
+    sec('Store bestsellers with no Shopping impressions', 'Top sellers in our showrooms, live on the website, with fewer than 20 Shopping impressions in 28 days. Check Merchant Center approval and campaign coverage.',
+      tbl([{label: 'Product', get: r => esc(r.name || r.id) + '<small>' + esc(r.id) + '</small>', cls: 'name'}, {label: 'Sold in store', num: true, get: r => int(r.store_units)}, {label: 'Store sales (ex-VAT)', num: true, get: r => gbp(r.store_revenue)}, {label: 'Shopping impressions', num: true, get: r => int(r.shopping_impressions)}], d.gaps, {limit: 15, empty: 'Every top store seller is showing in Shopping.'})) +
+    '<p class="foot">Returns use Google\u2019s conversion value, so they are higher than GA4 revenue where Google counts view-through or cross-device sales. Spend is for ONLINE Shopping products only.</p>';
+}
+
 /* ---------- landing pages ---------- */
 async function loadLanding(){
   const rs = await Promise.all([bq(SQL.channels), bq(SQL.pages)]);
@@ -1368,10 +1426,10 @@ const PILL = {good: '\u2713 Good', check: '! Check', fix: '\u2715 Fix'};
 const pill = (level, text) => '<span class="pill ' + level + '">' + PILL[level] + (text ? ' \u2013 ' + esc(text) : '') + '</span>';
 async function loadHealth(){
   const keys = ['ordersLatest','ga4Latest','feed','mapped','tracking','buildLog'];
-  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge)]);
+  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge), bq(SQL.shopSummary)]);
   failIfAuth(rs);
   const v = i => val(rs[i]);
-  return {ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null};
+  return {ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0]};
 }
 function renderHealth(el, h){
   const fresh = (label, latest, okDays, warnDays, note) => {
@@ -1397,6 +1455,11 @@ function renderHealth(el, h){
         (h.captureWk || []).slice(-8), {limit: 8, empty: 'No complete weeks to compare yet.'}) +
       '<p class="foot">Status over the last four weeks: ' + pill(cl) + '. A drop usually means consent, ad blockers or a payment redirect is stopping the purchase event.</p>');
   }
+  if(h.shop && h.shop.cost){
+    const sh = h.shop.cost_matched / h.shop.cost, shl = sh >= 0.95 ? 'good' : sh >= 0.85 ? 'check' : 'fix';
+    html += sec('Do Google Ads products match the feed?', 'The share of Shopping spend from ' + dmy(h.shop.ws) + ' to ' + dmy(h.shop.we) + ' that lands on a product in the feed. Below 95% the Shopping tab misses products, usually because the feed table is out of date.',
+      '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Shopping spend matched to a feed product</td><td class="num">' + (100 * sh).toFixed(1) + '%</td><td>' + pill(shl) + '</td></tr></tbody></table></div>');
+  }
   const m = h.mapped, ml = m == null ? 'fix' : m >= 0.95 ? 'good' : m >= 0.9 ? 'check' : 'fix';
   html += sec('Do store products match the website?', 'The share of store sales that lands on a product model in the feed. The opportunity list is reliable from 95%.',
     '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Store sales matched to a model in the feed</td><td class="num">' + (m == null ? '\u2013' : (100 * m).toFixed(1) + '%') + '</td><td>' + pill(ml) + '</td></tr></tbody></table></div>');
@@ -1406,7 +1469,9 @@ function renderHealth(el, h){
     html += sec('Is the product feed clean?', int(f.feed_rows) + ' feed rows roll up to ' + int(f.models) + ' models. Fix these in Feedonomics.',
       '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Rows</th><th class="num">Share</th><th>Status</th><th>Why it matters</th></tr></thead><tbody>' +
       '<tr><td>No product type</td><td class="num">' + int(f.no_type) + '</td><td class="num">' + (100 * f.no_type / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.no_type)) + '</td><td>These models cannot be compared with similar products by category.</td></tr>' +
-      '<tr><td>Link goes to the homepage</td><td class="num">' + int(f.home_links) + '</td><td class="num">' + (100 * f.home_links / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.home_links)) + '</td><td>Shopping ads for these products land on the homepage, not the product page.</td></tr></tbody></table></div>');
+      '<tr><td>Link goes to the homepage</td><td class="num">' + int(f.home_links) + '</td><td class="num">' + (100 * f.home_links / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.home_links)) + '</td><td>Shopping ads for these products land on the homepage, not the product page.</td></tr>' +
+      '<tr><td>Price is \u00A30.00</td><td class="num">' + int(f.zero_price) + '</td><td class="num">' + (100 * f.zero_price / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.zero_price)) + '</td><td>Google Shopping rejects items priced at zero, so these cannot advertise.</td></tr>' +
+      '<tr><td>Sale price above the normal price</td><td class="num">' + int(f.sale_above) + '</td><td class="num">' + (100 * f.sale_above / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.sale_above)) + '</td><td>Google ignores or rejects these, so the sale does not show.</td></tr></tbody></table></div>');
   }
   const ev = Object.fromEntries((h.tracking || []).map(r => [r.event_name, r]));
   const off = r => !r || r.events === 0;
@@ -1463,6 +1528,8 @@ function todoSection(h){
   if(h.mapped != null && h.mapped < 0.95) t.push({who: 'Dan', what: 'Only ' + (100 * h.mapped).toFixed(1) + '% of store sales match a product. Identify the unmatched codes in Store gap.', why: 'Below 95%, the opportunity list may miss products.'});
   if(h.feed){
     if(h.feed.no_type) t.push({who: 'Feedonomics', what: 'Add a product type to ' + int(h.feed.no_type) + ' feed rows.', why: 'Products without a category cannot be compared with similar products.'});
+    if(h.feed.zero_price) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.zero_price) + ' feed rows with a price of \u00A30.00 (or exclude them from the Google feed).', why: 'Google Shopping rejects zero-priced items, so those products cannot advertise.'});
+    if(h.feed.sale_above) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.sale_above) + ' feed rows where the sale price is above the normal price.', why: 'Google ignores or rejects these, so the sale price does not show.'});
     if(h.feed.home_links) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.home_links) + ' feed rows that link to the homepage.', why: 'Shopping ads for these products land on the homepage, not the product page.'});
   }
   const cw4 = (h.captureWk || []).slice(-4), crec = cw4.length ? cw4.reduce((t, r) => t + r.ga4_orders, 0) / Math.max(1, cw4.reduce((t, r) => t + r.ometria_orders, 0)) : (h.capture ? h.capture.raw_capture : null);
