@@ -152,6 +152,7 @@ td small{color:var(--muted)}
 .lede + .filters,.lede + .tablewrap,.lede + .banner{margin-top:24px}
 .lede + .hsec,.lede + .panel{margin-top:28px}
 .hsec .panel{padding:20px}
+@media (min-width:0){.tablewrap + .hsec,.panel + .hsec{margin-top:36px}}
 @media (max-width:700px){.fun .step{grid-template-columns:1fr;gap:4px}}
 </style>
 </head>
@@ -263,8 +264,13 @@ FROM ${T('bs_marts.channel_quality_28d')} GROUP BY channel ORDER BY sessions DES
 SELECT landing_path, page_type, channel_group, sessions, engaged_sessions, cart_sessions, purchase_sessions, revenue
 FROM ${T('bs_marts.landing_pages_28d')}`,
   searchTerms: `
-SELECT term, searches, sessions, sessions_with_click, click_rate, store_units, store_product, listed_online
+SELECT term, searches, sessions, zero_searches, sessions_with_click, click_rate, store_units, store_product, listed_online
 FROM ${T('bs_marts.search_terms_28d')} ORDER BY searches DESC LIMIT 1000`,
+  searchSummary: `SELECT raw_events, searches, zero_searches, searches_with_click FROM ${T('bs_marts.search_summary_28d')}`,
+  seeStore: `SELECT product_group_id, product_name, product_category, store_name, requests FROM ${T('bs_marts.see_in_store_28d')}`,
+  checkoutErrors: `
+SELECT CAST(event_date AS STRING) AS d, kind, label, raw_label, step, detail, events, sessions
+FROM ${T('bs_marts.checkout_errors_daily')}`,
   lists: `SELECT list_name, clicks, with_index, avg_index, top8_clicks, below12_clicks FROM ${T('bs_marts.plp_clicks_28d')} ORDER BY clicks DESC`,
   listItems: `SELECT list_name, product_group_id, product_name, clicks FROM ${T('bs_marts.plp_top_items_28d')} ORDER BY clicks DESC LIMIT 100`,
   products: `
@@ -291,7 +297,9 @@ SELECT SAFE_DIVIDE(SUM(IF(d.product_group_id IS NOT NULL, s.revenue_ex_vat, 0)),
 FROM ${T('ometria.store_product_sales')} AS s
 LEFT JOIN ${T('bs_core.dim_product_group')} AS d ON d.product_group_id = ${T('bs_core.model_key')}(s.sku)`,
   tracking: `
-SELECT event_name, COUNT(*) AS events, COUNTIF(ARRAY_LENGTH(items) > 0) AS with_items
+SELECT event_name, COUNT(*) AS events, COUNTIF(ARRAY_LENGTH(items) > 0) AS with_items,
+  COUNTIF((SELECT COUNT(1) FROM UNNEST(event_params) AS p WHERE p.key = CASE event_name
+    WHEN 'search' THEN 'number_of_results' WHEN 'see_in_store' THEN 'product_name' WHEN 'sample_order' THEN 'item_name' ELSE '' END) > 0) AS with_param
 FROM ${T('analytics_287404213.events_*')}
 WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)) AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
   AND event_name IN ('view_item_list','select_item','view_item','add_to_cart','begin_checkout','add_shipping_info','add_payment_info','purchase','search','view_search_results','sample_order','see_in_store','error_tracking')
@@ -837,19 +845,26 @@ function renderLanding(el, d){
 }
 
 /* ---------- site search ---------- */
-async function loadSearch(){ return bq(SQL.searchTerms); }
-function renderSearch(el, rows){
+async function loadSearch(){
+  const rs = await Promise.all([bq(SQL.searchTerms), bq(SQL.searchSummary)]);
+  return {rows: rs[0], sum: rs[1][0] || null};
+}
+function renderSearch(el, d){
+  const rows = d.rows, sm = d.sum;
+  const zero = rows.filter(r => r.zero_searches >= 2).sort((a, b) => b.zero_searches - a.zero_searches);
   const miss = rows.filter(r => r.store_units > 0 && r.listed_online === false).sort((a, b) => b.searches - a.searches);
-  const stuck = rows.filter(r => r.searches >= 20 && r.click_rate != null && r.click_rate < 0.3).sort((a, b) => b.searches - a.searches);
-  const total = rows.reduce((t, r) => t + r.searches, 0);
-  el.innerHTML = lede(miss.length ? miss.length + ' ' + plural(miss.length, 'search is', 'searches are') + ' for products you sell in store but not online.' : 'What visitors search for on the site.',
-      'Over the last 28 days, ' + int(total) + ' searches across ' + rows.length + ' terms searched five or more times.') +
+  const stuck = rows.filter(r => r.searches >= 20 && r.click_rate != null && r.click_rate < 0.3 && r.zero_searches < r.searches / 2).sort((a, b) => b.searches - a.searches);
+  const head = sm ? (sm.zero_searches ? pct(sm.zero_searches / sm.searches, 0) + ' of searches return no results.' : 'Almost every search returns a result.') : 'What visitors search for on the site.';
+  el.innerHTML = lede(head,
+      sm ? int(sm.searches) + ' searches in the last 28 days, counted once per visit however many letters were typed (' + int(sm.raw_events) + ' typing events). ' + pct(sm.searches_with_click / sm.searches, 0) + ' went on to click a product.' : 'Last 28 days.') +
+    sec('Searches that returned nothing', 'The site suggests up to four products as people type, so these terms showed none. Add the product, a synonym or a redirect.',
+      tbl([{label: 'Search', get: r => esc(r.term)}, {label: 'Searches with no result', num: true, get: r => int(r.zero_searches)}, {label: 'All searches', num: true, get: r => int(r.searches)}, {label: 'Also sold in store', get: r => r.store_product ? esc(r.store_product) : '', cls: 'name'}], zero, {limit: 20, empty: 'No term returned nothing more than once.'})) +
     sec('Searched for, sold in store, not on the website', 'The search term matches the name of a product that sells in store and has no page on the site.',
       tbl([{label: 'Search', get: r => esc(r.term)}, {label: 'Searches', num: true, get: r => int(r.searches)}, {label: 'Store product', get: r => esc(r.store_product), cls: 'name'}, {label: 'Sold in store', num: true, get: r => int(r.store_units)}], miss, {limit: 20, empty: 'No searches match store-only products.'})) +
-    sec('Searches that lead nowhere', 'Fewer than three in ten searchers clicked a product afterwards. Look for spelling, synonyms and missing products.',
+    sec('Searches with results that nobody clicks', 'Fewer than three in ten searchers clicked a product afterwards. Look at ranking, naming and what the preview shows.',
       tbl([{label: 'Search', get: r => esc(r.term)}, {label: 'Searches', num: true, get: r => int(r.searches)}, {label: 'Clicked a product', num: true, get: r => pct(r.click_rate, 0)}], stuck, {limit: 20, empty: 'Every frequent search leads to a product click.'})) +
     sec('Top searches', '', tbl([{label: 'Search', get: r => esc(r.term)}, {label: 'Searches', num: true, get: r => int(r.searches)}, {label: 'Clicked a product', num: true, get: r => pct(r.click_rate, 0)}, {label: 'Also sold in store', get: r => r.store_product ? esc(r.store_product) : '', cls: 'name'}], rows, {limit: 30})) +
-    '<p class="foot">The site does not yet record how many results a search returns, so a search with no product click afterwards stands in for a search with no results. Add search_results_count to the search event to measure it directly.</p>';
+    '<p class="foot">A typing sequence counts as one search when each entry extends the last within 20 seconds. The preview shows at most four products, so it cannot show how many results a full search page would return. Only terms searched five or more times, or returning nothing twice or more, are listed.</p>';
 }
 
 /* ---------- product lists ---------- */
@@ -865,8 +880,14 @@ function renderLists(el, d){
 }
 
 /* ---------- product pages ---------- */
-async function loadProducts(){ return bq(SQL.products); }
-function renderProducts(el, rows){
+async function loadProducts(){
+  const rs = await Promise.allSettled([bq(SQL.products), bq(SQL.seeStore)]);
+  failIfAuth(rs);
+  if(rs[0].status === 'rejected') throw rs[0].reason;
+  return {rows: rs[0].value, store: val(rs[1]) || [], storeErr: rs[1].status === 'rejected' ? rs[1].reason : null};
+}
+function renderProducts(el, d){
+  const rows = d.rows;
   const flagged = rows.filter(r => r.merch_review), sum = flagged.reduce((t, r) => t + (r.est_gbp_week || 0), 0);
   const q = state.pp.q.trim().toLowerCase();
   const list = rows.filter(r => (!state.pp.flagged || r.merch_review) && (!q || (r.name || '').toLowerCase().includes(q) || r.id.toLowerCase().includes(q)));
@@ -876,14 +897,39 @@ function renderProducts(el, rows){
     tbl([{label: 'Product', get: r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>', cls: 'name'},
          {label: 'Worth a week', num: true, get: r => r.est_gbp_week ? '<span class="money">' + gbp(r.est_gbp_week) + '</span>' : '\u2013'}, {label: 'Category', get: r => esc(r.category)}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)},
          {label: 'Add to basket', num: true, get: r => pct(r.cart_rate)}, {label: 'Category median', num: true, get: r => pct(r.peer_median_cart_rate)}], list, {limit: 40, empty: 'No products match.'}) +
+    findInStore(d, rows) +
     '<p class="foot">Add-to-basket is the share of visits to the page that added the product. Made-to-order products can convert differently from in-stock ones, and the feed cannot separate them yet, so treat a flag as a prompt to look, not a verdict. Products customers prefer to try in store are not excluded yet.</p>';
-  $('#pq', el).addEventListener('input', e => { state.pp.q = e.target.value; const pos = e.target.selectionStart; renderProducts(el, rows); const n = $('#pq', el); n.focus(); n.setSelectionRange(pos, pos); });
-  $('#pf', el).addEventListener('change', e => { state.pp.flagged = e.target.checked; renderProducts(el, rows); });
+  $('#pq', el).addEventListener('input', e => { state.pp.q = e.target.value; const pos = e.target.selectionStart; renderProducts(el, d); const n = $('#pq', el); n.focus(); n.setSelectionRange(pos, pos); });
+  $('#pf', el).addEventListener('change', e => { state.pp.flagged = e.target.checked; renderProducts(el, d); });
+}
+
+function findInStore(d, rows){
+  if(d.storeErr) return '<div class="banner"><strong>Find in store is missing.</strong> Re-run 01_build_europe-west2.sql to add it. BigQuery said: ' + esc(d.storeErr.message) + '</div>';
+  const total = d.store.reduce((t, r) => t + r.requests, 0);
+  if(!total) return '';
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const prods = new Map(), stores = new Map();
+  d.store.forEach(r => {
+    const k = r.product_name || '(unknown)'; const o = prods.get(k) || {name: k, id: r.product_group_id, requests: 0}; o.requests += r.requests; if(!o.id) o.id = r.product_group_id; prods.set(k, o);
+    stores.set(r.store_name || '(unknown)', (stores.get(r.store_name || '(unknown)') || 0) + r.requests);
+  });
+  const plist = [...prods.values()].map(o => { const m = o.id ? byId.get(o.id) : null; return {...o, visits: m ? m.pdp_sessions : null, cart: m ? m.cart_rate : null}; }).sort((a, b) => b.requests - a.requests);
+  const slist = [...stores.entries()].map(([name, n]) => ({name, n})).sort((a, b) => b.n - a.n);
+  return sec('Products people ask to see in store', int(total) + ' find-in-store clicks in 28 days across ' + plist.length + ' products. A product with many requests and a low add-to-basket rate may be one customers want to try before buying.',
+      tbl([{label: 'Product', get: r => esc(r.name), cls: 'name'}, {label: 'Requests', num: true, get: r => int(r.requests)}, {label: 'Page visits', num: true, get: r => int(r.visits)},
+           {label: 'Requests per 100 visits', num: true, get: r => r.visits ? (100 * r.requests / r.visits).toFixed(1) : '\u2013'}, {label: 'Add to basket', num: true, get: r => pct(r.cart)}], plist, {limit: 15})) +
+    sec('Find in store by showroom', '', tbl([{label: 'Showroom', get: r => esc(r.name)}, {label: 'Requests', num: true, get: r => int(r.n)}, {label: 'Share', num: true, get: r => pct(r.n / total, 0)}], slist, {limit: 15}));
 }
 
 /* ---------- checkout ---------- */
-async function loadCheckout(){ return bq(SQL.funnel); }
-function renderCheckout(el, all){
+async function loadCheckout(){
+  const rs = await Promise.allSettled([bq(SQL.funnel), bq(SQL.checkoutErrors)]);
+  failIfAuth(rs);
+  if(rs[0].status === 'rejected') throw rs[0].reason;
+  return {funnel: rs[0].value, errors: val(rs[1]) || [], errErr: rs[1].status === 'rejected' ? rs[1].reason : null};
+}
+function renderCheckout(el, d){
+  const all = d.funnel;
   const devices = [...new Set(all.map(r => r.device))].sort();
   const rows = all.filter(r => !state.co.device || r.device === state.co.device);
   const days = [...new Set(rows.map(r => r.d))].sort();
@@ -904,12 +950,36 @@ function renderCheckout(el, all){
     sec('Completion over time', 'Seven-day rolling rates. A sudden step down in either line is what the checkout alert watches for.', '<div class="panel">' + chartBox('cochart', 'Line chart of basket to checkout and checkout to purchase rates') + '</div>') +
     sec('Last 14 days', '', tbl([{label: 'Day', get: r => dm(r.d)}, {label: 'Visits', num: true, get: r => int(r.v)}, {label: 'Baskets', num: true, get: r => int(r.c)}, {label: 'Checkouts', num: true, get: r => int(r.k)}, {label: 'Bought', num: true, get: r => int(r.p)},
          {label: 'Basket to checkout', num: true, get: r => r.c ? pct(r.k / r.c, 0) : '\u2013'}, {label: 'Checkout to bought', num: true, get: r => r.k ? pct(r.p / r.k, 0) : '\u2013'}], tail, {limit: 14})) +
+    checkoutErrorsHtml(d) +
     '<p class="foot">Delivery and payment steps only appear when the site records them. Express payment buttons can skip the payment step, so it can read lower than it is.</p>';
-  $('#dev', el).addEventListener('change', e => { state.co.device = e.target.value; renderCheckout(el, all); });
+  $('#dev', el).addEventListener('change', e => { state.co.device = e.target.value; renderCheckout(el, d); });
   chart('cochart', {type: 'line', data: {labels: recent.map(dm), datasets: [
     {label: 'Checkout to bought', data: comp.map(v => v == null ? null : +(100 * v).toFixed(1)), borderColor: '#15203b', backgroundColor: '#15203b', tension: .25, pointRadius: 0, borderWidth: 2},
     {label: 'Basket to checkout', data: toChk.map(v => v == null ? null : +(100 * v).toFixed(1)), borderColor: '#a8721c', backgroundColor: '#a8721c', tension: .25, pointRadius: 0, borderWidth: 2}]},
     options: {responsive: true, maintainAspectRatio: false, scales: {x: {grid: {display: false}, ticks: {maxTicksLimit: 8, maxRotation: 0}}, y: {ticks: {callback: v => v + '%'}, grid: {color: '#e8e5e0'}}}, plugins: {legend: {position: 'bottom', labels: {boxWidth: 12, boxHeight: 12}}}}});
+}
+
+function checkoutErrorsHtml(d){
+  if(d.errErr) return '<div class="banner"><strong>Checkout errors are missing.</strong> Re-run 01_build_europe-west2.sql to add them. BigQuery said: ' + esc(d.errErr.message) + '</div>';
+  if(!d.errors.length) return '';
+  const maxd = d.errors.reduce((m, r) => r.d > m ? r.d : m, '');
+  const cut = new Date(parse(maxd).getTime() - 27 * 864e5).toISOString().slice(0, 10);
+  const rows = d.errors.filter(r => r.d >= cut);
+  const forms = new Map(), coupons = new Map();
+  rows.filter(r => r.kind === 'form').forEach(r => {
+    const k = (r.label || '(unnamed)') + '|' + (r.step || ''); const o = forms.get(k) || {form: r.label || '(unnamed)', step: r.step, events: 0, sessions: 0, details: new Map()};
+    o.events += r.events; o.sessions += r.sessions; if(r.detail) o.details.set(r.detail, (o.details.get(r.detail) || 0) + r.events); forms.set(k, o);
+  });
+  rows.filter(r => r.kind === 'coupon').forEach(r => {
+    const o = coupons.get(r.label) || {code: r.label, events: 0, raw: new Set()}; o.events += r.events; o.raw.add(r.raw_label); coupons.set(r.label, o);
+  });
+  const fl = [...forms.values()].map(o => ({...o, top: [...o.details.entries()].sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || ''})).sort((a, b) => b.events - a.events);
+  const cl = [...coupons.values()].sort((a, b) => b.events - a.events);
+  const ft = fl.reduce((t, r) => t + r.events, 0), ct = cl.reduce((t, r) => t + r.events, 0);
+  return sec('Form errors at checkout', int(ft) + ' form errors in the last 28 days. Browser and third-party script errors are left out.',
+      tbl([{label: 'Form', get: r => esc(r.form)}, {label: 'Step', get: r => esc(r.step || '')}, {label: 'Errors', num: true, get: r => int(r.events)}, {label: 'Most common message', get: r => esc(r.top), cls: 'name'}], fl, {limit: 12, empty: 'No form errors recorded.'})) +
+    sec('Coupon codes that failed', int(ct) + ' failed attempts across ' + cl.length + ' ' + plural(cl.length, 'code', 'codes') + '. A code typed in several ways, such as WELCOME15 and Welcome15, may mean the till is case-sensitive.',
+      tbl([{label: 'Code', get: r => esc(r.code)}, {label: 'Failed attempts', num: true, get: r => int(r.events)}, {label: 'Typed in', num: true, get: r => r.raw.size + ' ' + plural(r.raw.size, 'way', 'ways')}, {label: 'Seen as', get: r => esc([...r.raw].slice(0, 4).join(', ')), cls: 'name'}], cl, {limit: 12, empty: 'No coupon failures recorded.'}));
 }
 
 /* ---------- journeys ---------- */
@@ -972,13 +1042,13 @@ function renderHealth(el, h){
     ['add_shipping_info', 'Chose delivery', 'Optional checkout step. Without it the funnel skips delivery.', r => off(r) ? ['check', 'Not firing'] : ['good', '']],
     ['add_payment_info', 'Entered payment', 'Optional checkout step. Without it the funnel skips payment.', r => off(r) ? ['check', 'Not firing'] : ['good', '']],
     ['purchase', 'Purchases', 'Feeds online units sold.', on],
-    ['sample_order', 'Swatch requests', 'Should carry the product in view so swatches can be tied to products.', item],
-    ['see_in_store', 'Find in store', 'Should carry the product in view to measure the showroom effect.', item],
-    ['search', 'On-site searches', 'Should include the number of results, to find searches that return nothing.', r => off(r) ? ['fix', 'Not firing'] : ['check', 'Result count not verified']],
-    ['error_tracking', 'Errors', 'Very high volume. Confirm what it records before using it for checkout errors.', r => off(r) ? ['check', 'Not firing'] : (r.events > 50000 ? ['check', 'Check what it records'] : ['good', ''])]
+    ['sample_order', 'Swatch requests', 'Records the fabric ordered, not the product it was ordered for, so swatches cannot yet be tied to products.', r => off(r) ? ['fix', 'Not firing'] : ['check', 'Fabric only']],
+    ['see_in_store', 'Find in store', 'Records product, category and showroom. Feeds Product pages.', r => off(r) ? ['fix', 'Not firing'] : (r.with_param / r.events > 0.9 ? ['good', ''] : ['check', 'Product name missing on some'])],
+    ['search', 'On-site searches', 'Records the number of results (up to four) as people type. Feeds Site search.', r => off(r) ? ['fix', 'Not firing'] : (r.with_param / r.events > 0.9 ? ['good', ''] : ['check', 'Result count missing on some'])],
+    ['error_tracking', 'Errors', 'Mostly browser and third-party script noise. The form and coupon errors in it feed the Checkout tab.', r => off(r) ? ['check', 'Not firing'] : ['check', 'Mostly noise']]
   ];
   html += sec('Is tracking capturing what this dashboard needs?', 'GA4 events in the last seven complete days.',
-    '<div class="tablewrap"><table><thead><tr><th>Event</th><th class="num">Events</th><th class="num">With a product</th><th>Status</th><th>Why it matters</th></tr></thead><tbody>' +
+    '<div class="tablewrap"><table><thead><tr><th>Event</th><th class="num">Events</th><th class="num">With items</th><th>Status</th><th>Why it matters</th></tr></thead><tbody>' +
     tr.map(([name, label, why, fn]) => { const r = ev[name]; const [lvl, txt] = fn(r); return '<tr><td>' + esc(label) + '<small style="display:block;color:var(--muted)">' + esc(name) + '</small></td><td class="num">' + (r ? int(r.events) : '0') + '</td><td class="num">' + (r ? int(r.with_items) : '0') + '</td><td>' + pill(lvl, txt) + '</td><td>' + esc(why) + '</td></tr>'; }).join('') + '</tbody></table></div>');
   el.innerHTML = html;
 }
