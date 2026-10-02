@@ -377,6 +377,9 @@ SELECT COUNT(*) AS feed_rows,
   COUNTIF(RTRIM(link, '/') = 'https://www.barkerandstonehouse.co.uk') AS home_links,
   (SELECT COUNT(*) FROM ${T('bs_core.dim_product_group')}) AS models
 FROM ${T('google_ads_raw.product_feed')}`,
+  feedAge: `SELECT CAST(TIMESTAMP_MILLIS(last_modified_time) AS STRING) AS t FROM ${T('google_ads_raw.__TABLES__')} WHERE table_id = 'product_feed'`,
+  capture: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, ga4_orders, ometria_orders, raw_capture, factor_applied FROM ${T('bs_marts.ga4_capture')}`,
+  captureWeekly: `SELECT CAST(wk AS STRING) AS wk, ga4_orders, ometria_orders, capture FROM ${T('bs_marts.ga4_capture_weekly')} ORDER BY wk`,
   mapped: `
 SELECT SAFE_DIVIDE(SUM(IF(d.product_group_id IS NOT NULL, s.revenue_ex_vat, 0)), SUM(s.revenue_ex_vat)) AS mapped_share
 FROM ${T('ometria.store_product_sales')} AS s
@@ -1365,10 +1368,10 @@ const PILL = {good: '\u2713 Good', check: '! Check', fix: '\u2715 Fix'};
 const pill = (level, text) => '<span class="pill ' + level + '">' + PILL[level] + (text ? ' \u2013 ' + esc(text) : '') + '</span>';
 async function loadHealth(){
   const keys = ['ordersLatest','ga4Latest','feed','mapped','tracking','buildLog'];
-  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog)]);
+  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge)]);
   failIfAuth(rs);
   const v = i => val(rs[i]);
-  return {ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6)};
+  return {ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null};
 }
 function renderHealth(el, h){
   const fresh = (label, latest, okDays, warnDays, note) => {
@@ -1384,7 +1387,16 @@ function renderHealth(el, h){
     '<div class="tablewrap"><table><thead><tr><th>Source</th><th>Latest date</th><th>Age</th><th>Status</th><th>What to do</th></tr></thead><tbody>' +
     fresh('Ometria orders', h.ordersLatest, 8, 14, 'Reload orders_full weekly.') +
     fresh('Store sales by product', state.period && state.period.end_date, 8, 14, 'Append the last complete week each week.') +
-    fresh('GA4 export', h.ga4Latest, 2, 4, 'The daily export lands the next morning.') + '</tbody></table></div>');
+    fresh('GA4 export', h.ga4Latest, 2, 4, 'The daily export lands the next morning.') +
+    (h.feedLoaded ? fresh('Product feed table', h.feedLoaded, 7, 21, 'Reload the feed so new products are included.') : '') + '</tbody></table></div>');
+  if(h.capture && h.capture.raw_capture != null){
+    const cr = h.capture.raw_capture, cl = cr >= 0.95 ? 'good' : cr >= 0.85 ? 'check' : 'fix';
+    html += sec('Does GA4 record every online order?', 'GA4 recorded ' + (100 * cr).toFixed(0) + '% of the online orders in Ometria from ' + dmy(h.capture.ws) + ' to ' + dmy(h.capture.we) + '. Online units on Store gap are scaled up to allow for the rest (by ' + (100 * (1 / h.capture.factor_applied - 1)).toFixed(0) + '%). Conversion figures from GA4 are not scaled.',
+      tbl([{label: 'Week starting', get: r => dm(r.wk)}, {label: 'GA4 orders', num: true, get: r => int(r.ga4_orders)}, {label: 'Ometria online orders', num: true, get: r => int(r.ometria_orders)}, {label: 'GA4 as a share of Ometria', num: true, get: r => pct(r.capture, 0)},
+           {label: 'Status', get: r => r.capture >= 0.95 ? pill('good') : r.capture >= 0.85 ? pill('check') : pill('fix')}],
+        (h.captureWk || []).slice(-8), {limit: 8, empty: 'No complete weeks to compare yet.'}) +
+      '<p class="foot">Overall status for the period: ' + pill(cl) + '. A drop usually means consent, ad blockers or a payment redirect is stopping the purchase event.</p>');
+  }
   const m = h.mapped, ml = m == null ? 'fix' : m >= 0.95 ? 'good' : m >= 0.9 ? 'check' : 'fix';
   html += sec('Do store products match the website?', 'The share of store sales that lands on a product model in the feed. The opportunity list is reliable from 95%.',
     '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Store sales matched to a model in the feed</td><td class="num">' + (m == null ? '\u2013' : (100 * m).toFixed(1) + '%') + '</td><td>' + pill(ml) + '</td></tr></tbody></table></div>');
@@ -1446,12 +1458,14 @@ function todoSection(h){
   const t = [];
   (h.buildLog || []).concat(h.gscLog || []).filter(r => r.status !== 'ok').forEach(r => t.push({who: 'Dan', what: 'Build step ' + r.step + ' failed: ' + (r.message || 'no message') + '. Send the message to Claude to fix.', why: 'The tab that uses it will be empty or out of date.'}));
   const age = daysBehind(h.ordersLatest); if(age == null || age > 8) t.push({who: 'Dan', what: 'Reload Ometria orders into BigQuery' + (age != null ? ' (the data is ' + age + ' days old)' : '') + '.', why: 'Weekly sales and the online share are wrong without it.'});
+  const fage = h.feedLoaded ? daysBehind(h.feedLoaded) : null; if(fage != null && fage > 14) t.push({who: 'Dan', what: 'Reload the product feed table in BigQuery (it is ' + fage + ' days old).', why: 'Products added since then will wrongly show as not on the website, and new prices and stock are missed.'});
   const sage = state.period ? daysBehind(state.period.end_date) : null; if(sage != null && sage > 8) t.push({who: 'Dan', what: 'Append the last complete week of store sales (' + sage + ' days old).', why: 'Store gap uses these sales to find what sells in store.'});
   if(h.mapped != null && h.mapped < 0.95) t.push({who: 'Dan', what: 'Only ' + (100 * h.mapped).toFixed(1) + '% of store sales match a product. Identify the unmatched codes in Store gap.', why: 'Below 95%, the opportunity list may miss products.'});
   if(h.feed){
     if(h.feed.no_type) t.push({who: 'Feedonomics', what: 'Add a product type to ' + int(h.feed.no_type) + ' feed rows.', why: 'Products without a category cannot be compared with similar products.'});
     if(h.feed.home_links) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.home_links) + ' feed rows that link to the homepage.', why: 'Shopping ads for these products land on the homepage, not the product page.'});
   }
+  if(h.capture && h.capture.raw_capture != null && h.capture.raw_capture < 0.9) t.push({who: 'Developer', what: 'GA4 records about ' + (100 * h.capture.raw_capture).toFixed(0) + '% of online orders. Check consent mode, ad blockers and the purchase event on the order confirmation page and any payment redirects.', why: 'Every GA4 sales figure is under-counted. The dashboard scales online units to compensate, but conversion and channel figures are not.'});
   const ev = Object.fromEntries((h.tracking || []).map(r => [r.event_name, r]));
   if(!ev.view_item_list || !ev.view_item_list.events) t.push({who: 'Developer', what: 'Send view_item_list and item_list_index on product lists.', why: 'Without them Product lists cannot show which positions underperform.'});
   if(ev.sample_order && ev.sample_order.events) t.push({who: 'Developer', what: 'Add the product being viewed to the swatch request (sample_order) event.', why: 'It records the fabric only, so swatch requests cannot be tied to products.'});
