@@ -219,7 +219,7 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 .field{display:block;margin:0 0 12px;font-weight:500}
 .field input{display:block;width:100%;margin-top:4px;font:inherit;border:1px solid var(--line);border-radius:4px;padding:8px 12px}
 .exportmsg{min-height:1.4em;margin:12px 0;color:var(--muted);font-size:.92rem}
-.dlgact{display:flex;justify-content:flex-end;gap:10px}
+.dlgact{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px}
 .btn:disabled{opacity:.6;cursor:wait}
 .status #exportBtn{background:var(--ink);color:#fff;border-color:var(--ink)}
 </style>
@@ -246,13 +246,14 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 
 <dialog id="exportDlg" aria-labelledby="exportTitle">
   <h2 id="exportTitle">Export slides for the Monday meeting</h2>
-  <p class="sub">Downloads a PowerPoint in the style of the Weekly Performance Pack. Every slide names the products or pages involved, and ends with numbered actions, an owner and a due date. Open it, copy the slides you want and paste them at the end of the deck.</p>
+  <p class="sub">Downloads a PowerPoint in the style of the Weekly Performance Pack. Every slide names the products or pages involved, and ends with numbered actions, an owner and a due date. Open it, copy the slides you want and paste them at the end of the deck. The checklist is an Excel file listing every product, page and search term behind the chosen slides, with a status dropdown for the team to tick off.</p>
   <div id="exportList" class="optlist"></div>
   <label class="field">Label, top right of each slide<input id="exportLabel" type="text"></label>
   <label class="field">Due date shown against each action<input id="exportDue" type="text"></label>
+  <label class="field">Items per list on the checklist<input id="exportPer" type="number" min="5" max="200" value="25"></label>
   <label class="check"><input type="checkbox" id="exportNotes" checked> Add speaker notes</label>
   <p id="exportMsg" class="exportmsg" role="status"></p>
-  <div class="dlgact"><button type="button" class="btn quiet" id="exportCancel">Close</button><button type="button" class="btn" id="exportGo">Download slides</button></div>
+  <div class="dlgact"><button type="button" class="btn quiet" id="exportCancel">Close</button><button type="button" class="btn quiet" id="checklistGo">Download checklist (Excel)</button><button type="button" class="btn" id="exportGo">Download slides</button></div>
 </dialog>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -1822,6 +1823,163 @@ async function exportSlides(sel, label, withNotes, due, onStatus){
   await pres.writeFile({fileName: 'Opportunities-' + stamp + '.pptx'});
   return {made, empty, unavailable};
 }
+/* ---------- checklist (Excel): every product, page and search term behind the slides ---------- */
+const TICK = {todo: '\u2610 To do', doing: '\u25D0 In progress', done: '\u2611 Done', skip: '\u2013 Not needed'};
+async function loadExcelJs(){
+  if(window.ExcelJS) return;
+  try { await loadScript('https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js'); }
+  catch(e) { await loadScript('https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js'); }
+  if(!window.ExcelJS) throw new Error('The spreadsheet library did not load. Check your connection and try again.');
+}
+function checklistItems(sel, data, perList){
+  const items = [], per = periodText(), site = p => p ? CONFIG.SITE + p : '', cap = a => a.slice(0, perList);
+  const push = (slide, action, type, o) => items.push({slide, action, type, item: o.item, code: o.code || '', link: o.link || '', owner: o.owner || '', worth: o.worth || '', what: o.what || '', evidence: o.evidence || ''});
+  const has = id => sel.includes(id);
+  if(has('add')){
+    segList('1 Not listed online').forEach(r => { const x = explainRow(r);
+      push('Add products to the website', 'Add to website', 'Product', {item: r.name, code: r.id, owner: SEG['1 Not listed online'].owner, worth: gbp(r.opportunity) + ' over ' + per.months, what: 'Confirm it is current range. Supply images, dimensions, options, lead time and price. Build the page and add it to the feed.', evidence: x.why}); });
+  }
+  if(has('groups')){
+    ['2 Listed, undiscovered', '3 Viewed, not added', '4 Under-indexing online', '0 Check mapping'].forEach(k => cap(segList(k)).forEach(r => { const x = explainRow(r);
+      push('Fix, find and push', SEG[k].label, k === '0 Check mapping' ? 'Store code' : 'Product', {item: r.name, code: r.id, link: r.url && r.url !== '/' ? site(r.url) : '', owner: SEG[k].owner, worth: gbp(r.opportunity) + ' over ' + per.months, what: x.next, evidence: x.why}); }));
+  }
+  if(has('alerts') && data.actions){
+    const covered = r => (r.rule_code.startsWith('SEO') && has('seo')) || (r.rule_code === 'PDP_MERCH_REVIEW' && has('pages')) || (r.rule_code === 'STORE_BESTSELLER_GAP' && (has('add') || has('groups')));
+    actionRows(data.actions).filter(r => r.confirmed && !covered(r)).sort((a, b) => (a.priority === 'P1' ? 0 : 1) - (b.priority === 'P1' ? 0 : 1) || (b.gbp || 0) - (a.gbp || 0)).forEach(r => {
+      const isPage = String(r.entity_name).startsWith('/');
+      push('Alerts to action', (r.priority === 'P1' ? 'URGENT: ' : '') + (RULES[r.rule_code] || r.rule_code), r.rule_code.startsWith('CHECKOUT') ? 'Checkout step' : isPage ? 'Landing page' : 'Product',
+        {item: r.entity_name, code: isPage ? '' : r.entity_id, link: isPage ? site(r.entity_name) : '', owner: r.owner_pillar, worth: r.gbp != null ? gbp(r.gbp) + ' a week' : '', what: r.recommended_action, evidence: r.evidence});
+    });
+  }
+  if(has('checkout') && data.checkout){
+    const d = data.checkout, maxd = d.errors.reduce((m, r) => r.d > m ? r.d : m, '');
+    if(maxd){
+      const cut = new Date(parse(maxd).getTime() - 27 * 864e5).toISOString().slice(0, 10);
+      const forms = new Map(); d.errors.filter(r => r.kind === 'form' && r.d >= cut).forEach(r => { const k = (r.label || '(unnamed)') + (r.step ? ' step ' + r.step : ''); const o = forms.get(k) || {k, n: 0, det: new Map()}; o.n += r.events; if(r.detail) o.det.set(r.detail, (o.det.get(r.detail) || 0) + r.events); forms.set(k, o); });
+      [...forms.values()].sort((a, b) => b.n - a.n).slice(0, 3).forEach(o => { const det = [...o.det.entries()].sort((a, b) => b[1] - a[1])[0];
+        push('Checkout health', 'Fix form errors', 'Checkout form', {item: o.k, owner: 'eCommerce and developer', worth: int(o.n) + ' errors in 28 days', what: 'Reproduce with a test order and raise it with the developer.', evidence: det ? 'Most often \u201C' + det[0] + '\u201D.' : ''}); });
+      const cps = new Map(); d.errors.filter(r => r.kind === 'coupon' && r.d >= cut).forEach(r => { const o = cps.get(r.label) || {k: r.label, n: 0, raw: new Set()}; o.n += r.events; o.raw.add(r.raw_label); cps.set(r.label, o); });
+      [...cps.values()].sort((a, b) => b.n - a.n).slice(0, 5).forEach(o => push('Checkout health', 'Fix coupon code', 'Coupon code', {item: o.k, owner: 'eCommerce', worth: int(o.n) + ' failed attempts in 28 days', what: o.raw.size > 1 ? 'Make codes case-insensitive and check the code is valid.' : 'Check the code is valid and its rules are clear.', evidence: 'Typed ' + o.raw.size + ' ' + plural(o.raw.size, 'way', 'ways') + ': ' + [...o.raw].slice(0, 4).join(', ') + '.'}));
+    }
+  }
+  if(has('seo') && data.seo){
+    const d = data.seo, money = g => d.rps ? ' (about ' + gbp(g * d.rps) + ')' : '';
+    const byPage = new Map(); d.ctr.forEach(r => { const o = byPage.get(r.page) || {gain: 0, top: r}; o.gain += r.ctr_gap_clicks; if(r.ctr_gap_clicks > o.top.ctr_gap_clicks) o.top = r; byPage.set(r.page, o); });
+    cap([...byPage.entries()].sort((a, b) => b[1].gain - a[1].gain)).forEach(([page, o]) => push('Organic search wins', 'Rewrite title and meta', 'Landing page',
+      {item: page, link: site(page), owner: 'SEO/Content', worth: int(o.gain) + ' clicks a month' + money(o.gain), what: 'Rewrite the title (about 60 characters) and meta description around \u201C' + o.top.query + '\u201D. Check for an AI Overview or Shopping box above the result.', evidence: 'Position ' + o.top.avg_position.toFixed(1) + ', click-through ' + pct(o.top.ctr) + ' against ' + pct(o.top.expected_ctr) + ' expected.'}));
+    const near = new Map(); d.near.forEach(r => { const o = near.get(r.page); if(!o || r.impressions > o.impressions) near.set(r.page, r); });
+    cap([...near.values()].sort((a, b) => b.impressions - a.impressions)).forEach(r => push('Organic search wins', 'Lift towards page one', 'Landing page',
+      {item: r.page, link: site(r.page), owner: 'SEO/Content', worth: int(r.rank_gap_clicks) + ' clicks at position 3', what: 'Improve the copy and add internal links from busy category pages for \u201C' + r.query + '\u201D.', evidence: 'Position ' + r.avg_position.toFixed(1) + ', ' + int(r.impressions) + ' impressions, ' + int(r.clicks) + ' clicks.'}));
+    cap(d.drops).forEach(r => push('Organic search wins', 'Investigate lost clicks', 'Landing page',
+      {item: r.page, link: site(r.page), owner: 'SEO/Content', worth: int(r.clicks_prior - r.clicks_cur) + ' fewer clicks', what: 'Check the page loads, is not blocked or noindex, redirects and canonicals are unchanged, and the product is still in the feed.', evidence: 'Clicks ' + int(r.clicks_cur) + ' against ' + int(r.clicks_prior) + ' (' + pct(r.change_pct, 0) + '); average position ' + (r.pos_cur == null ? '\u2013' : r.pos_cur.toFixed(1)) + ' against ' + (r.pos_prior == null ? '\u2013' : r.pos_prior.toFixed(1)) + '.'}));
+  }
+  if(has('search') && data.search){
+    const rows = data.search.rows;
+    cap(rows.filter(r => r.store_units > 0 && r.listed_online === false).sort((a, b) => b.searches - a.searches)).forEach(r => push('Site search', 'List the product people search for', 'Search term',
+      {item: r.term, owner: 'Product and Range, eCommerce', worth: int(r.searches) + ' searches', what: 'Check \u201C' + r.store_product + '\u201D is current range and add it to the website.', evidence: int(r.searches) + ' searches in 28 days. Sold in store: ' + int(r.store_units) + ' (' + r.store_product + ').'}));
+    cap(rows.filter(r => r.zero_searches >= 2).sort((a, b) => b.zero_searches - a.zero_searches)).forEach(r => push('Site search', 'Fix a search that returns nothing', 'Search term',
+      {item: r.term, owner: 'eCommerce', worth: int(r.zero_searches) + ' searches with no result', what: 'Add the product, a synonym or a redirect.', evidence: int(r.zero_searches) + ' of ' + int(r.searches) + ' searches returned nothing.'}));
+    cap(rows.filter(r => r.searches >= 20 && r.click_rate != null && r.click_rate < 0.3 && r.zero_searches < r.searches / 2).sort((a, b) => b.searches - a.searches)).forEach(r => push('Site search', 'Review a search nobody clicks', 'Search term',
+      {item: r.term, owner: 'eCommerce', worth: int(r.searches) + ' searches', what: 'Change what the preview shows, or rename or re-rank the product.', evidence: pct(r.click_rate, 0) + ' of searchers clicked a product.'}));
+  }
+  if(has('pages') && data.products){
+    const d = data.products, byId = new Map(d.rows.map(r => [r.id, r]));
+    cap(d.rows.filter(r => r.merch_review).sort((a, b) => (b.est_gbp_week || 0) - (a.est_gbp_week || 0))).forEach(r => push('Product pages to fix', 'Review the product page', 'Product page',
+      {item: r.name, code: r.id, link: r.url && r.url !== '/' ? site(r.url) : '', owner: 'eCommerce', worth: gbp(r.est_gbp_week) + ' a week', what: 'Open the page as a customer. Check price, delivery time, images, dimensions and options.', evidence: int(r.pdp_sessions) + ' visits; ' + pct(r.cart_rate) + ' add to basket against ' + pct(r.peer_median_cart_rate) + ' for the category.'}));
+    const prods = new Map(); (d.store || []).forEach(r => { const k = r.product_name || '(unknown)'; const o = prods.get(k) || {name: k, id: r.product_group_id, n: 0}; o.n += r.requests; if(!o.id) o.id = r.product_group_id; prods.set(k, o); });
+    cap([...prods.values()].sort((a, b) => b.n - a.n)).forEach(o => { const m = o.id ? byId.get(o.id) : null;
+      push('Product pages to fix', 'Add a swatch or showroom prompt', 'Product', {item: o.name, code: o.id || '', link: m && m.url && m.url !== '/' ? site(m.url) : '', owner: 'eCommerce, Showrooms', worth: int(o.n) + ' find-in-store requests', what: 'Customers want to try this first. Add a swatch or showroom prompt on the page.', evidence: int(o.n) + ' find-in-store clicks in 28 days' + (m ? '; ' + pct(m.cart_rate) + ' add to basket.' : '.')}); });
+  }
+  return items;
+}
+function buildChecklistWorkbook(items, label, due, perList){
+  const wb = new window.ExcelJS.Workbook(); wb.creator = 'Barker and Stonehouse'; wb.title = 'Opportunities checklist';
+  wb.calcProperties = {fullCalcOnLoad: true};
+  const NAVY = 'FF1F3864', HEAD = 'FF2F4F8F', LINE = 'FFD5DAE3', GREY = 'FF5A6472';
+  const border = {top: {style: 'thin', color: {argb: LINE}}, left: {style: 'thin', color: {argb: LINE}}, bottom: {style: 'thin', color: {argb: LINE}}, right: {style: 'thin', color: {argb: LINE}}};
+  const sm = wb.addWorksheet('Summary', {views: [{showGridLines: false}]});
+  const ck = wb.addWorksheet('Checklist', {views: [{state: 'frozen', xSplit: 1, ySplit: 1}]});
+  /* checklist sheet */
+  const cols = [['Status', 15], ['Action', 26], ['Item', 40], ['Owner', 18], ['Due', 11], ['Worth (est.)', 18], ['What to do', 48], ['Notes', 24], ['Date done', 12], ['Done by', 13], ['Slide', 26], ['Type', 14], ['Code', 15], ['Link', 34], ['Evidence', 56]];
+  ck.columns = cols.map(([header, width]) => ({header, width}));
+  const hr = ck.getRow(1); hr.height = 24;
+  hr.eachCell(c => { c.font = {name: 'Calibri', bold: true, color: {argb: 'FFFFFFFF'}, size: 11}; c.fill = {type: 'pattern', pattern: 'solid', fgColor: {argb: HEAD}}; c.alignment = {vertical: 'middle', wrapText: true}; c.border = border; });
+  items.forEach((it, i) => {
+    const r = ck.addRow([TICK.todo, it.action, it.item, it.owner, due, it.worth, it.what, '', '', '', it.slide, it.type, it.code, '', it.evidence]);
+    r.alignment = {vertical: 'top', wrapText: true}; r.font = {name: 'Calibri', size: 10.5};
+    r.eachCell({includeEmpty: true}, c => { c.border = border; });
+    r.getCell(1).font = {name: 'Calibri', size: 11, bold: true};
+    if(it.link){ const l = r.getCell(14); l.value = {text: it.link.replace(CONFIG.SITE, ''), hyperlink: it.link}; l.font = {name: 'Calibri', size: 10.5, color: {argb: 'FF1F5FA8'}, underline: true}; }
+    r.getCell(5).alignment = {vertical: 'top', horizontal: 'left'};
+    r.getCell(9).numFmt = 'dd mmm yyyy';
+  });
+  const last = Math.max(items.length + 1, 2);
+  ck.dataValidations.add('A2:A' + last, {type: 'list', allowBlank: false, showErrorMessage: true, errorTitle: 'Choose a status', error: 'Pick a status from the list.', formulae: ['"' + [TICK.todo, TICK.doing, TICK.done, TICK.skip].join(',') + '"']});
+  ck.autoFilter = {from: 'A1', to: 'O' + last};
+  const fill = argb => ({type: 'pattern', pattern: 'solid', bgColor: {argb}});
+  ck.addConditionalFormatting({ref: 'A2:O' + last, rules: [
+    {type: 'expression', priority: 1, formulae: ['$A2="' + TICK.done + '"'], style: {fill: fill('FFE2F0D9'), font: {color: {argb: GREY}}}},
+    {type: 'expression', priority: 2, formulae: ['$A2="' + TICK.doing + '"'], style: {fill: fill('FFFFF2CC')}},
+    {type: 'expression', priority: 3, formulae: ['$A2="' + TICK.skip + '"'], style: {fill: fill('FFEDEDED'), font: {color: {argb: 'FF8C8C8C'}}}}
+  ]});
+  ck.pageSetup = {orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9, printTitlesRow: '1:1', printArea: 'A1:J' + last};
+  /* summary sheet */
+  sm.columns = [{width: 34}, {width: 36}, {width: 12}, {width: 12}, {width: 14}, {width: 12}];
+  const t = sm.getCell('A1'); t.value = 'Opportunities checklist'; t.font = {name: 'Calibri', size: 20, bold: true, color: {argb: NAVY}}; sm.getRow(1).height = 30;
+  sm.getCell('A2').value = label; sm.getCell('A2').font = {name: 'Calibri', size: 11, color: {argb: GREY}};
+  sm.mergeCells('A3:F3'); const how = sm.getCell('A3');
+  how.value = 'How to use: on the Checklist sheet, change Status on each row with the dropdown: To do, In progress, Done or Not needed. Add the date and who did it, and any notes. The grey columns on the right (slide, type, code, link, evidence) are for reference and do not print. The counts on this page update by themselves. Lists show the biggest ' + perList + ' per group; the full lists are in the dashboard. Alerts that are also covered by another slide appear once, under that slide.';
+  how.alignment = {wrapText: true, vertical: 'top'}; how.font = {name: 'Calibri', size: 10.5, color: {argb: GREY}}; sm.getRow(3).height = 62;
+  const n = items.length + 1;
+  const stat = (row, label_, f, fmt) => { const a = sm.getCell('A' + row), b = sm.getCell('B' + row); a.value = label_; a.font = {name: 'Calibri', size: 11, bold: true}; b.value = {formula: f}; b.font = {name: 'Calibri', size: 11, bold: true, color: {argb: NAVY}}; b.alignment = {horizontal: 'left'}; if(fmt) b.numFmt = fmt; };
+  stat(5, 'Items on the checklist', 'COUNTA(Checklist!$C$2:$C$' + n + ')');
+  stat(6, TICK.done, 'COUNTIF(Checklist!$A$2:$A$' + n + ',"' + TICK.done + '")');
+  stat(7, TICK.doing, 'COUNTIF(Checklist!$A$2:$A$' + n + ',"' + TICK.doing + '")');
+  stat(8, TICK.skip, 'COUNTIF(Checklist!$A$2:$A$' + n + ',"' + TICK.skip + '")');
+  stat(9, TICK.todo, 'B5-B6-B7-B8');
+  stat(10, 'Complete', 'IF(B5-B8=0,0,B6/(B5-B8))', '0%');
+  const table = (startRow, title, heads, rows) => {
+    sm.getCell('A' + startRow).value = title; sm.getCell('A' + startRow).font = {name: 'Calibri', size: 13, bold: true, color: {argb: NAVY}};
+    const hRow = sm.getRow(startRow + 1);
+    heads.forEach((h, i) => { const c = hRow.getCell(i + 1); c.value = h; c.font = {name: 'Calibri', bold: true, color: {argb: 'FFFFFFFF'}}; c.fill = {type: 'pattern', pattern: 'solid', fgColor: {argb: HEAD}}; c.border = border; c.alignment = {horizontal: i >= heads.length - (heads.length === 6 ? 4 : 3) ? 'right' : 'left'}; });
+    rows.forEach((r, i) => { const row = sm.getRow(startRow + 2 + i); r.forEach((v, j) => { const c = row.getCell(j + 1); c.value = typeof v === 'string' && v.startsWith('=') ? {formula: v.slice(1)} : v; c.border = border; c.font = {name: 'Calibri', size: 10.5}; if(j >= heads.length - (heads.length === 6 ? 4 : 3)) c.alignment = {horizontal: 'right'}; if(typeof v === 'string' && v.includes('/')) c.numFmt = '0%'; }); });
+    return startRow + 2 + rows.length;
+  };
+  const pairs = []; items.forEach(it => { if(!pairs.some(p => p[0] === it.slide && p[1] === it.action)) pairs.push([it.slide, it.action]); });
+  let r0 = 13;
+  const rowsA = pairs.map(([s_, a_], i) => { const rr = r0 + 2 + i, q = 'Checklist!$K$2:$K$' + n + ',$A' + rr + ',Checklist!$B$2:$B$' + n + ',$B' + rr;
+    return [s_, a_, '=COUNTIFS(' + q + ')', '=COUNTIFS(' + q + ',Checklist!$A$2:$A$' + n + ',"' + TICK.done + '")', '=COUNTIFS(' + q + ',Checklist!$A$2:$A$' + n + ',"' + TICK.doing + '")', '=IF(C' + rr + '=0,0,D' + rr + '/C' + rr + ')']; });
+  const afterA = table(r0, 'Progress by slide and action', ['Slide', 'Action', 'Items', 'Done', 'In progress', '% done'], rowsA);
+  for(let i = 0; i < pairs.length; i++) sm.getCell('F' + (r0 + 2 + i)).numFmt = '0%';
+  const owners = []; items.forEach(it => { if(it.owner && !owners.includes(it.owner)) owners.push(it.owner); });
+  const r1 = afterA + 2;
+  const rowsO = owners.map((o, i) => { const rr = r1 + 2 + i, q = 'Checklist!$D$2:$D$' + n + ',$A' + rr;
+    return [o, '=COUNTIFS(' + q + ')', '=COUNTIFS(' + q + ',Checklist!$A$2:$A$' + n + ',"' + TICK.done + '")', '=IF(B' + rr + '=0,0,C' + rr + '/B' + rr + ')']; });
+  table(r1, 'Progress by owner', ['Owner', 'Items', 'Done', '% done'], rowsO);
+  for(let i = 0; i < owners.length; i++) sm.getCell('D' + (r1 + 2 + i)).numFmt = '0%';
+  sm.pageSetup = {orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9};
+  return wb;
+}
+async function exportChecklist(sel, label, due, perList, onStatus){
+  onStatus('Loading the spreadsheet library\u2026');
+  await loadExcelJs();
+  const keys = [...new Set(SLIDE_OPTIONS.filter(o => o[0] !== 'plan' && sel.includes(o[0])).flatMap(o => o[3]))];
+  onStatus('Loading the data for the checklist\u2026');
+  await Promise.all(keys.map(k => { const c = startLoad(k); return c.promise || Promise.resolve(); }));
+  const data = {}, unavailable = [];
+  keys.forEach(k => { const c = cache[k]; if(c && c.status === 'ok') data[k] = c.data; else unavailable.push(TABS[k].label); });
+  onStatus('Building the checklist\u2026');
+  const items = checklistItems(sel, data, perList);
+  if(!items.length) throw new Error('None of the chosen slides had items to list.');
+  const wb = buildChecklistWorkbook(items, label, due, perList);
+  const buf = await wb.xlsx.writeBuffer();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
+  a.download = 'Opportunities-checklist-' + new Date().toISOString().slice(0, 10) + '.xlsx';
+  document.body.appendChild(a); a.click(); a.remove();
+  return {count: items.length, unavailable};
+}
+
 function openExport(){
   const dlg = $('#exportDlg'); if(!dlg.showModal) return;
   $('#exportList').innerHTML = SLIDE_OPTIONS.map(o => '<label class="opt"><input type="checkbox" name="sl" value="' + o[0] + '" checked><span><b>' + esc(o[1]) + '</b><small>' + esc(o[2]) + '</small></span></label>').join('');
@@ -1836,12 +1994,23 @@ function wireExport(){
   $('#exportGo').addEventListener('click', async () => {
     const sel = [...document.querySelectorAll('#exportList input:checked')].map(i => i.value), msg = $('#exportMsg'), go = $('#exportGo');
     if(!sel.length){ msg.textContent = 'Choose at least one slide.'; return; }
-    go.disabled = true;
+    go.disabled = true; $('#checklistGo').disabled = true;
     try {
       const r = await exportSlides(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportNotes').checked, $('#exportDue').value.trim() || nextMonday(), t => { msg.textContent = t; });
       msg.textContent = 'Downloaded ' + r.made.length + ' ' + plural(r.made.length, 'slide', 'slides') + '.' + (r.empty.length ? ' Left out because there was nothing to show: ' + r.empty.join(', ') + '.' : '') + (r.unavailable.length ? ' Could not load: ' + r.unavailable.join(', ') + '.' : '') + ' Open the file, copy the slides and paste them at the end of the deck.';
     } catch(e) { msg.textContent = 'Could not make the slides: ' + (e && e.message ? e.message : e); }
-    go.disabled = false;
+    go.disabled = false; $('#checklistGo').disabled = false;
+  });
+  $('#checklistGo').addEventListener('click', async () => {
+    const sel = [...document.querySelectorAll('#exportList input:checked')].map(i => i.value), msg = $('#exportMsg'), go = $('#exportGo'), cg = $('#checklistGo');
+    if(!sel.length){ msg.textContent = 'Choose at least one slide.'; return; }
+    go.disabled = true; cg.disabled = true;
+    try {
+      const per = Math.max(5, Math.min(200, parseInt($('#exportPer').value, 10) || 25));
+      const r = await exportChecklist(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportDue').value.trim() || nextMonday(), per, t => { msg.textContent = t; });
+      msg.textContent = 'Downloaded the checklist with ' + r.count + ' ' + plural(r.count, 'item', 'items') + '.' + (r.unavailable.length ? ' Could not load: ' + r.unavailable.join(', ') + '.' : '') + ' Share it with the team and ask them to set each row to Done.';
+    } catch(e) { msg.textContent = 'Could not make the checklist: ' + (e && e.message ? e.message : e); }
+    go.disabled = false; cg.disabled = false;
   });
 }
 
