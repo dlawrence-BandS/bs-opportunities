@@ -206,6 +206,22 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 @media (max-width:820px){.gcols{grid-template-columns:1fr;gap:16px}.segcard{grid-template-columns:1fr}.segcard>div+div{border-left:0;border-top:1px solid var(--line)}
   .prio li{grid-template-columns:32px minmax(0,1fr)}.prio .side{grid-column:2;align-items:flex-start;text-align:left}}
 @media print{.mast .status button,.tabs,.filters,.tools,.btn,.why-btn,.skip{display:none!important}.guide{break-inside:avoid}body{background:#fff}}
+
+/* export dialog */
+#exportDlg{border:1px solid var(--line);border-radius:8px;padding:24px 26px;width:min(580px,calc(100% - 32px));color:var(--ink)}
+#exportDlg::backdrop{background:rgba(21,32,59,.45)}
+#exportDlg h2{font-size:1.25rem;margin-bottom:6px}
+#exportDlg .sub{color:var(--muted);font-size:.92rem;margin-bottom:14px}
+.optlist{display:grid;gap:8px;margin-bottom:16px;max-height:44vh;overflow:auto}
+.opt{display:flex;gap:10px;align-items:flex-start;cursor:pointer}
+.opt input{margin-top:4px}
+.opt small{display:block;color:var(--muted)}
+.field{display:block;margin:0 0 12px;font-weight:500}
+.field input{display:block;width:100%;margin-top:4px;font:inherit;border:1px solid var(--line);border-radius:4px;padding:8px 12px}
+.exportmsg{min-height:1.4em;margin:12px 0;color:var(--muted);font-size:.92rem}
+.dlgact{display:flex;justify-content:flex-end;gap:10px}
+.btn:disabled{opacity:.6;cursor:wait}
+.status #exportBtn{background:var(--ink);color:#fff;border-color:var(--ink)}
 </style>
 </head>
 <body>
@@ -228,6 +244,15 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 </main>
 <noscript><div class="wrap"><p>This dashboard needs JavaScript to load its data.</p></div></noscript>
 
+<dialog id="exportDlg" aria-labelledby="exportTitle">
+  <h2 id="exportTitle">Export slides for the Monday meeting</h2>
+  <p class="sub">Downloads a PowerPoint in the style of the Weekly Performance Pack: same size, navy header, cards, tables and Calibri. Open it, copy the slides you want and paste them at the end of the deck.</p>
+  <div id="exportList" class="optlist"></div>
+  <label class="field">Label, top right of each slide<input id="exportLabel" type="text"></label>
+  <label class="check"><input type="checkbox" id="exportNotes" checked> Add speaker notes</label>
+  <p id="exportMsg" class="exportmsg" role="status"></p>
+  <div class="dlgact"><button type="button" class="btn quiet" id="exportCancel">Close</button><button type="button" class="btn" id="exportGo">Download slides</button></div>
+</dialog>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script>
@@ -784,12 +809,13 @@ function renderStatus(){
   const s = $('#status'); let html = '';
   if(state.loading) html = 'Loading from BigQuery\u2026';
   else if(state.demo) html = 'Sample data';
-  else if(state.loadedAt) html = 'Loaded ' + state.loadedAt.toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit'}) + ' <button type="button" id="refresh">Refresh</button>';
+  else if(state.loadedAt) html = 'Loaded ' + state.loadedAt.toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit'}) + ' <button type="button" id="refresh">Refresh</button> <button type="button" id="exportBtn">Export slides</button>';
   const bits = [];
   if(state.period && !state.loading) bits.push('Store sales ' + esc(periodText().span));
   if(state.builtAt && !state.loading) bits.push('Built ' + esc(ukTime(state.builtAt)));
   s.innerHTML = bits.concat(html ? [html] : []).join('&emsp;');
   const r = $('#refresh'); if(r) r.addEventListener('click', () => { if(!accessToken || Date.now() > tokenExpiry) signIn(); else loadAll(); });
+  const eb = $('#exportBtn'); if(eb) eb.addEventListener('click', openExport);
 }
 function renderBanners(){
   const b = $('#banners'); let html = '';
@@ -830,7 +856,7 @@ function friendlyError(e, v){
 function startLoad(v){
   let c = cache[v]; if(c) return c;
   c = cache[v] = {status: 'loading'};
-  TABS[v].load().then(d => { c.status = 'ok'; c.data = d; })
+  c.promise = TABS[v].load().then(d => { c.status = 'ok'; c.data = d; })
     .catch(e => { c.status = 'error'; c.error = e; if(e instanceof AuthError){ accessToken = null; showGate('Your sign-in has expired. Sign in again to continue.'); } })
     .finally(() => { updateBadges(); if(!accessToken) return; if(state.view === v) renderLazy(v); else if(state.view === 'overview') renderOverview(); });
   return c;
@@ -1431,8 +1457,325 @@ function todoSection(h){
     t.length ? tbl([{label: 'Who', get: r => '<b>' + esc(r.who) + '</b>', cls: 'nowrap'}, {label: 'What to do', get: r => esc(r.what), cls: 'name'}, {label: 'Why it matters', get: r => esc(r.why), cls: 'wide'}], t, {limit: 20}) : '<div class="tablewrap"><p class="empty">Everything this page checks is healthy.</p></div>');
 }
 
+/* ---------- export slides (PowerPoint, in the style of the Weekly Performance Pack) ---------- */
+const PPT = {navy: '1F3864', head: '2F4F8F', mid: 'C7D2E8', line: 'D5DAE3', ink: '1A1A1A', grey: '5A6472', wash: 'F2F4F8', green: '2E7D32', red: 'C62828', font: 'Calibri'};
+const SLIDE_OPTIONS = [
+  ['intro',  'Section title',                          'An opening slide for the Opportunities section', []],
+  ['add',    'Products to add to the website',         'The biggest products sold in store and missing online', []],
+  ['groups', 'Where the rest of the opportunity sits', 'The other groups, with what each means and who owns it', []],
+  ['alerts', 'Alerts to action',                       'Confirmed alerts with the evidence and the owner', ['actions']],
+  ['checkout', 'Checkout health',                      'The funnel for 28 days, form errors and failed coupons', ['checkout']],
+  ['seo',    'Organic search wins',                    'Titles to rewrite and pages losing clicks', ['seo']],
+  ['search', 'Site search',                            'Searches that return nothing, and store-only products people search for', ['search']],
+  ['pages',  'Product pages to fix',                   'Popular pages that do not add to basket, and find in store', ['products']]
+];
+const clip = (t, n) => { t = String(t == null ? '' : t); return t.length > n ? t.slice(0, n - 1).trimEnd() + '\u2026' : t; };
+const pts = (a, b) => (a == null || b == null) ? null : (a - b) * 100;
+const ptsText = (d, suffix) => d == null ? '' : Math.abs(d) < 0.05 ? 'level' + (suffix ? ' ' + suffix.replace(/^vs /, 'with ') : '') : (d >= 0 ? '+' : '\u2212') + Math.abs(d).toFixed(1) + ' pts' + (suffix ? ' ' + suffix : '');
+
+function loadScript(src){
+  return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('Could not load ' + src)); document.head.appendChild(s); });
+}
+async function loadPptx(){
+  if(window.PptxGenJS) return;
+  try { await loadScript('https://cdn.jsdelivr.net/npm/pptxgenjs@4.0.1/dist/pptxgen.bundle.js'); }
+  catch(e) { await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pptxgenjs/3.12.0/pptxgen.bundle.js'); }
+  if(!window.PptxGenJS) throw new Error('The slide library did not load. Check your connection and try again.');
+}
+
+/* building blocks that copy the pack's layout */
+function pBase(pres, title, sub, label){
+  const s = pres.addSlide(); s.background = {color: 'FFFFFF'};
+  s.addShape('rect', {x: 0, y: 0, w: 13.3333, h: 0.95, fill: {color: PPT.navy}, line: {color: PPT.navy, width: 0}});
+  s.addText(title, {x: 0.45, y: 0.12, w: 9.5, h: 0.45, fontFace: PPT.font, fontSize: 24, bold: true, color: 'FFFFFF', margin: 0, valign: 'top', isTextBox: true});
+  s.addText(sub, {x: 0.45, y: 0.56, w: 9.5, h: 0.3, fontFace: PPT.font, fontSize: 11, color: PPT.mid, margin: 0, valign: 'top', isTextBox: true});
+  s.addText(label, {x: 9.6, y: 0.3, w: 3.3, h: 0.35, fontFace: PPT.font, fontSize: 11, color: PPT.mid, align: 'right', margin: 0, valign: 'top', isTextBox: true});
+  return s;
+}
+function pCards(s, cards, y){
+  y = y || 1.25;
+  const n = cards.length, gap = 0.18, total = 12.42, w = (total - gap * (n - 1)) / n;
+  cards.forEach((c, i) => {
+    const x = 0.45 + i * (w + gap);
+    s.addShape('roundRect', {x, y, w, h: 1.55, rectRadius: 0.06, fill: {color: 'FFFFFF'}, line: {color: PPT.line, width: 1}, shadow: {type: 'outer', color: '9AA5B5', opacity: 0.35, blur: 6, offset: 2, angle: 90}});
+    s.addShape('rect', {x, y, w, h: 0.06, fill: {color: PPT.navy}, line: {color: PPT.navy, width: 0}});
+    s.addText(c.label, {x: x + 0.1, y: y + 0.16, w: w - 0.2, h: 0.26, fontFace: PPT.font, fontSize: 9, bold: true, color: PPT.grey, align: 'center', charSpacing: 1, margin: 0, isTextBox: true});
+    const long = String(c.value).length > 11;
+    s.addText(c.value, {x: x + 0.1, y: y + (long ? 0.46 : 0.44), w: w - 0.2, h: long ? 0.5 : 0.5, fontFace: PPT.font, fontSize: long ? 13 : 22, bold: true, color: PPT.navy, align: 'center', valign: 'middle', margin: 0, fit: 'shrink', isTextBox: true});
+    s.addText(c.delta || '', {x: x + 0.1, y: y + 0.98, w: w - 0.2, h: 0.28, fontFace: PPT.font, fontSize: 11, bold: true, color: c.tone === 'good' ? PPT.green : c.tone === 'bad' ? PPT.red : PPT.navy, align: 'center', margin: 0, isTextBox: true});
+    s.addText(c.sub || '', {x: x + 0.1, y: y + 1.22, w: w - 0.2, h: 0.26, fontFace: PPT.font, fontSize: 9.5, color: PPT.grey, align: 'center', margin: 0, isTextBox: true});
+  });
+  return y + 1.55;
+}
+function pTable(s, y, cols, rows, o){
+  o = o || {};
+  const size = o.size || 10.5, rowH = o.rowH || 0.3;
+  const hdr = cols.map(c => ({text: c.label, options: {bold: true, color: 'FFFFFF', fill: {color: PPT.head}, align: c.align || 'left', fontFace: PPT.font, fontSize: size, valign: 'middle'}}));
+  const body = rows.map(r => r.map((cell, j) => {
+    const c = (cell && typeof cell === 'object') ? cell : {text: cell};
+    return {text: String(c.text == null ? '' : c.text), options: {color: c.color || (j === 0 ? PPT.ink : PPT.grey), bold: !!c.bold, align: cols[j].align || 'left', fontFace: PPT.font, fontSize: size, valign: 'middle', fill: {color: 'FFFFFF'}}};
+  }));
+  s.addTable([hdr].concat(body), {x: 0.45, y, w: 12.42, colW: cols.map(c => c.w), rowH, border: {type: 'solid', pt: 0.5, color: PPT.line}, margin: [2, 5, 2, 5]});
+  return y + rowH * (rows.length + 1);
+}
+function pNotes(s, y, bullets){
+  const h = Math.max(0.9, 7.25 - y);
+  s.addShape('roundRect', {x: 0.45, y, w: 12.4, h, rectRadius: 0.05, fill: {color: PPT.wash}, line: {color: PPT.line, width: 1}});
+  s.addText(bullets.map((t, i) => ({text: t, options: {bullet: {indent: 18}, breakLine: i < bullets.length - 1, paraSpaceAfter: 6}})),
+    {x: 0.65, y: y + 0.12, w: 12.0, h: h - 0.24, fontFace: PPT.font, fontSize: 11.5, color: PPT.ink, valign: 'top', margin: 0, isTextBox: true});
+}
+function pDone(s, ctx, text){ if(ctx.notes && text) s.addNotes(text); }
+
+/* slide builders: each returns true when it made a slide */
+function slideIntro(pres, ctx){
+  const st = segStats(), gaps = ['1 Not listed online', '2 Listed, undiscovered', '3 Viewed, not added', '4 Under-indexing online'];
+  const sum = gaps.reduce((t, k) => t + st[k].sum, 0), n = gaps.reduce((t, k) => t + st[k].n, 0), add = st['1 Not listed online'];
+  const per = periodText();
+  const s = pres.addSlide(); s.background = {color: PPT.navy};
+  s.addShape('rect', {x: 0, y: 5.05, w: 13.3333, h: 0.05, fill: {color: '8AA0CC'}, line: {color: '8AA0CC', width: 0}});
+  s.addText('BARKER AND STONEHOUSE', {x: 0.8, y: 1.5, w: 11, h: 0.35, fontFace: PPT.font, fontSize: 13, color: '9FB3D9', charSpacing: 3, margin: 0, isTextBox: true});
+  s.addText('Opportunities and Optimisations', {x: 0.8, y: 2.0, w: 11.5, h: 0.9, fontFace: PPT.font, fontSize: 40, bold: true, color: 'FFFFFF', margin: 0, isTextBox: true});
+  s.addText('Products to add, pages to fix and what to chase this week  \u00B7  ' + ctx.label.replace(/^Opportunities\s+\u00B7\s+/, ''), {x: 0.8, y: 3.0, w: 11.5, h: 0.4, fontFace: PPT.font, fontSize: 15, color: PPT.mid, margin: 0, isTextBox: true});
+  s.addText(gbpK(sum), {x: 0.8, y: 5.5, w: 11.5, h: 0.65, fontFace: PPT.font, fontSize: 34, bold: true, color: 'FFFFFF', margin: 0, isTextBox: true});
+  s.addText('Estimated missed online sales across ' + n + ' products, ex-VAT over ' + per.months + '  \u00B7  ' + add.n + ' ' + plural(add.n, 'product sells', 'products sell') + ' in store but ' + plural(add.n, 'is', 'are') + ' not on the website', {x: 0.8, y: 6.2, w: 11.5, h: 0.5, fontFace: PPT.font, fontSize: 14, color: PPT.mid, margin: 0, isTextBox: true});
+  pDone(s, ctx, 'Opening slide for the Opportunities section. The headline is the estimated online sales missed across every product that sells in store and under-sells online (ex-VAT, over ' + per.months + '). It ranks opportunities and is not a forecast.');
+  return true;
+}
+function slideAdd(pres, ctx){
+  const list = state.rows.filter(r => r.segment === '1 Not listed online').sort((a, b) => b.opportunity - a.opportunity);
+  if(!list.length) return false;
+  const per = periodText(), st = segStats();
+  const sum = list.reduce((t, r) => t + (r.opportunity || 0), 0), units = list.reduce((t, r) => t + (r.store_units || 0), 0), rev = list.reduce((t, r) => t + (r.store_revenue || 0), 0);
+  const others = ['2 Listed, undiscovered', '3 Viewed, not added', '4 Under-indexing online'].reduce((a, k) => ({n: a.n + st[k].n, sum: a.sum + st[k].sum}), {n: 0, sum: 0});
+  const top = list.slice(0, 7), topShare = sum ? top.reduce((t, r) => t + r.opportunity, 0) / sum : 0;
+  const s = pBase(pres, 'Products to add to the website', 'Sold in our showrooms, not on the website  \u00B7  store sales ' + per.span, ctx.label);
+  const y = pCards(s, [
+    {label: 'PRODUCTS TO ADD', value: String(list.length), delta: gbpK(sum) + ' est. missed', tone: 'good', sub: 'ex-VAT over ' + per.months},
+    {label: 'SOLD IN STORE', value: int(units), delta: 'none sold online', tone: 'bad', sub: 'units'},
+    {label: 'STORE SALES', value: rev ? gbpK(rev) : '\u2013', delta: 'ex-VAT', sub: 'on these products'},
+    {label: 'BIGGEST GAP', value: clip(list[0].name, 26), delta: gbp(list[0].opportunity), tone: 'good', sub: 'est. missed sales'},
+    {label: 'OTHER GAPS', value: gbpK(others.sum), delta: others.n + ' ' + plural(others.n, 'product', 'products'), sub: 'found, fix or push'}
+  ]);
+  const end = pTable(s, y + 0.2, [{label: 'Product', w: 6.1}, {label: 'Sold in store', w: 1.8, align: 'right'}, {label: 'Store sales (ex-VAT)', w: 2.2, align: 'right'}, {label: 'Est. missed sales (ex-VAT)', w: 2.32, align: 'right'}],
+    top.map(r => [clip(r.name, 70), int(r.store_units), r.store_revenue ? gbp(r.store_revenue) : '\u2013', {text: gbp(r.opportunity), color: PPT.green, bold: true}]));
+  pNotes(s, end + 0.15, [
+    list.length + ' ' + plural(list.length, 'product', 'products') + ' sold in store over ' + per.span + ' and ' + plural(list.length, 'has', 'have') + ' no page on the website. ' + (list.length > top.length ? 'The top ' + top.length + ' account for ' + Math.round(100 * topShare) + '% of the estimated ' + gbpK(sum) + '.' : 'Together they are worth an estimated ' + gbpK(sum) + ' ex-VAT over ' + per.months + '.'),
+    'Ask: Product and Range to confirm which are current range and can be delivered, then supply images, dimensions, options, lead time and price so the pages can be built.',
+    'Decision for the meeting: who builds the pages and by when. Care kits and removal services are already excluded; display pieces may remain, so check with the showrooms.'
+  ]);
+  pDone(s, ctx, 'Estimated missed sales compare each product\u2019s store units with how much of similar products\u2019 sales happen online, priced at the store average (ex-VAT). It ranks opportunities and is not a forecast. Full list with evidence is in the dashboard (Store gap).');
+  return true;
+}
+function slideGroups(pres, ctx){
+  const st = segStats(), per = periodText();
+  const keys = ['1 Not listed online', '2 Listed, undiscovered', '3 Viewed, not added', '4 Under-indexing online', '0 Check mapping'].filter(k => st[k].n);
+  if(!keys.length) return false;
+  const gaps = keys.filter(k => k !== '0 Check mapping'), sum = gaps.reduce((t, k) => t + st[k].sum, 0), n = gaps.reduce((t, k) => t + st[k].n, 0);
+  const big = gaps.slice().sort((a, b) => st[b].sum - st[a].sum)[0];
+  const s = pBase(pres, 'Where the rest of the opportunity sits', 'Estimated missed online sales by what is holding each product back  \u00B7  ex-VAT over ' + per.months, ctx.label);
+  const y = pCards(s, [
+    {label: 'TOTAL MISSED SALES', value: gbpK(sum), delta: 'ex-VAT', tone: 'good', sub: 'over ' + per.months},
+    {label: 'PRODUCTS', value: String(n), delta: 'selling below potential', sub: 'in four groups'},
+    {label: 'BIGGEST GROUP', value: SEG[big].label, delta: gbpK(st[big].sum), tone: 'good', sub: st[big].n + ' ' + plural(st[big].n, 'product', 'products')}
+  ]);
+  const end = pTable(s, y + 0.2, [{label: 'Group', w: 2.2}, {label: 'Products', w: 1.0, align: 'right'}, {label: 'Est. missed sales', w: 1.7, align: 'right'}, {label: 'What it means', w: 5.3}, {label: 'Owner', w: 2.22}],
+    keys.map(k => [SEG[k].label, String(st[k].n), {text: gbpK(st[k].sum), color: PPT.green, bold: true}, clip(SEG[k].short, 70), clip(SEG[k].owner, 34)]));
+  const top = k => state.rows.filter(r => r.segment === k).sort((a, b) => b.opportunity - a.opportunity)[0];
+  const bullets = ['2 Listed, undiscovered', '3 Viewed, not added', '4 Under-indexing online'].filter(k => st[k].n).map(k => { const r = top(k); return SEG[k].label + ': biggest is ' + clip(r.name, 60) + ' (' + gbp(r.opportunity) + '). ' + SEG[k].steps[0]; });
+  if(st['0 Check mapping'].n) bullets.push('Identify ' + st['0 Check mapping'].n + ' store ' + plural(st['0 Check mapping'].n, 'code', 'codes') + ' that sell in store but cannot be matched to a product (' + gbpK(st['0 Check mapping'].sum) + '). Look them up in Ometria.');
+  pNotes(s, end + 0.15, bullets.slice(0, 4));
+  pDone(s, ctx, 'Groups apply in order: not on the website, then findability (page visits), then page quality (add to basket), then overall online share. Steps for each group are in the dashboard (Store gap).');
+  return true;
+}
+function slideAlerts(pres, ctx){
+  const d = ctx.data.actions; if(!d) return false;
+  const rows = actionRows(d).filter(r => r.confirmed).sort((a, b) => (a.priority === 'P1' ? 0 : 1) - (b.priority === 'P1' ? 0 : 1) || (b.gbp || 0) - (a.gbp || 0));
+  if(!rows.length) return false;
+  const urgent = rows.filter(r => r.priority === 'P1'), total = rows.reduce((t, r) => t + (r.gbp || 0), 0), top = rows[0];
+  const s = pBase(pres, 'Alerts to action', 'Confirmed by the nightly checks  \u00B7  an alert counts once seen on two days, urgent alerts straight away', ctx.label);
+  const y = pCards(s, [
+    {label: 'CONFIRMED ALERTS', value: String(rows.length), delta: urgent.length ? urgent.length + ' urgent' : 'none urgent', tone: urgent.length ? 'bad' : 'good', sub: 'across the site'},
+    {label: 'WORTH A WEEK', value: total ? gbpK(total) : '\u2013', delta: 'if they continue', sub: 'estimated sales at stake'},
+    {label: 'LARGEST', value: clip(RULES[top.rule_code] || top.rule_code, 28), delta: top.gbp != null ? gbp(top.gbp) + ' a week' : '', tone: 'bad', sub: clip(top.entity_name, 34)},
+    {label: 'TEAMS INVOLVED', value: String(new Set(rows.map(r => r.owner_pillar)).size), delta: clip([...new Set(rows.map(r => r.owner_pillar))].join(', '), 38), sub: 'who needs to act'}
+  ]);
+  const show = rows.slice(0, 5);
+  const end = pTable(s, y + 0.2, [{label: 'Alert', w: 2.1}, {label: 'Where', w: 2.7}, {label: 'What we see', w: 4.7}, {label: 'Worth a week', w: 1.4, align: 'right'}, {label: 'Owner', w: 1.52}],
+    show.map(r => [{text: (r.priority === 'P1' ? 'URGENT  ' : '') + (RULES[r.rule_code] || r.rule_code), color: r.priority === 'P1' ? PPT.red : PPT.ink, bold: r.priority === 'P1'}, clip(r.entity_name, 44), clip(r.evidence, 95), r.gbp != null ? gbp(r.gbp) : '\u2013', clip(r.owner_pillar, 18)]),
+    {size: 10, rowH: 0.42});
+  const bullets = [];
+  if(urgent.length) bullets.push('Urgent: ' + urgent.map(r => (RULES[r.rule_code] || r.rule_code) + (r.entity_name ? ' (' + clip(r.entity_name, 40) + ')' : '')).join('; ') + '. ' + urgent[0].recommended_action);
+  bullets.push('Biggest by value: ' + (RULES[top.rule_code] || top.rule_code) + ' \u2013 ' + clip(top.entity_name, 50) + '. ' + clip(top.evidence, 140));
+  bullets.push('Each alert has fix steps in the dashboard (Actions > How to fix). Owners to report back at next Monday\u2019s meeting.');
+  pNotes(s, end + 0.15, bullets);
+  pDone(s, ctx, 'Values are estimates of weekly sales at stake if the problem continues. Search alerts price clicks at the organic revenue per visit.');
+  return true;
+}
+function slideCheckout(pres, ctx){
+  const d = ctx.data.checkout; if(!d || !d.funnel.length) return false;
+  const days = [...new Set(d.funnel.map(r => r.d))].sort(), last = days.slice(-28), prev = days.slice(-56, -28);
+  const sum = (ds, k, dev) => d.funnel.filter(r => ds.includes(r.d) && (!dev || r.device === dev)).reduce((t, r) => t + r[k], 0);
+  const rate = (ds, a, b, dev) => { const x = sum(ds, b, dev); return x ? sum(ds, a, dev) / x : null; };
+  const cb = rate(last, 'purchase_sessions', 'checkout_sessions'), cbp = prev.length ? rate(prev, 'purchase_sessions', 'checkout_sessions') : null;
+  const bc = rate(last, 'checkout_sessions', 'cart_sessions'), bcp = prev.length ? rate(prev, 'checkout_sessions', 'cart_sessions') : null;
+  const ab = rate(last, 'cart_sessions', 'pdp_sessions'), abp = prev.length ? rate(prev, 'cart_sessions', 'pdp_sessions') : null;
+  const tone = v => v == null || Math.abs(v) < 0.05 ? '' : v >= 0 ? 'good' : 'bad';
+  const maxd = d.errors.reduce((m, r) => r.d > m ? r.d : m, ''), cut = maxd ? new Date(parse(maxd).getTime() - 27 * 864e5).toISOString().slice(0, 10) : '';
+  const pcut = maxd ? new Date(parse(maxd).getTime() - 55 * 864e5).toISOString().slice(0, 10) : '';
+  const err = (kind, from, to) => d.errors.filter(r => r.kind === kind && r.d >= from && (!to || r.d < to)).reduce((t, r) => t + r.events, 0);
+  const fe = err('form', cut), fep = err('form', pcut, cut), ce = err('coupon', cut), cep = err('coupon', pcut, cut);
+  const chg = (a, b) => b ? (a >= b ? '+' : '\u2212') + Math.abs(Math.round(100 * (a - b) / b)) + '% vs previous 28 days' : 'last 28 days';
+  const s = pBase(pres, 'Checkout health', 'Last 28 days to ' + dm(last[last.length - 1]) + '  \u00B7  visits counted once per step reached', ctx.label);
+  const y = pCards(s, [
+    {label: 'CHECKOUT TO BOUGHT', value: pct(cb, 1), delta: ptsText(pts(cb, cbp), 'vs previous 28 days') || 'last 28 days', tone: tone(pts(cb, cbp)), sub: 'visits that started checkout'},
+    {label: 'BASKET TO CHECKOUT', value: pct(bc, 1), delta: ptsText(pts(bc, bcp), 'vs previous 28 days') || 'last 28 days', tone: tone(pts(bc, bcp)), sub: 'visits that added to basket'},
+    {label: 'ADD TO BASKET', value: pct(ab, 1), delta: ptsText(pts(ab, abp), 'vs previous 28 days') || 'last 28 days', tone: tone(pts(ab, abp)), sub: 'of visits to a product page'},
+    {label: 'FORM ERRORS', value: int(fe), delta: chg(fe, fep), tone: fep ? (fe > fep ? 'bad' : 'good') : '', sub: 'delivery, collection, payment, coupon'},
+    {label: 'FAILED COUPONS', value: int(ce), delta: chg(ce, cep), tone: cep ? (ce > cep ? 'bad' : 'good') : '', sub: 'attempts that did not apply'}
+  ]);
+  const STEPS = [['sessions', 'Visits'], ['pdp_sessions', 'Viewed a product'], ['cart_sessions', 'Added to basket'], ['checkout_sessions', 'Started checkout'], ['shipping_sessions', 'Chose delivery'], ['payment_sessions', 'Entered payment'], ['purchase_sessions', 'Bought']].filter(([k]) => sum(last, k) > 0);
+  const rows = STEPS.map(([k, l], i) => {
+    const n = sum(last, k), pn = prev.length ? sum(prev, k) : null, before = i ? sum(last, STEPS[i - 1][0]) : null, pbefore = i && prev.length ? sum(prev, STEPS[i - 1][0]) : null;
+    const now = before ? n / before : null, was = pbefore ? pn / pbefore : null, ch = pts(now, was);
+    return [l, int(n), i ? pct(now, 1) : '', prev.length ? int(pn) : '\u2013', i && ch != null ? {text: ptsText(ch), color: ch >= 0 ? PPT.green : PPT.red, bold: true} : ''];
+  });
+  const end = pTable(s, y + 0.2, [{label: 'Step', w: 3.4}, {label: 'Last 28 days', w: 2.2, align: 'right'}, {label: '% of previous step', w: 2.4, align: 'right'}, {label: 'Previous 28 days', w: 2.2, align: 'right'}, {label: 'Change in step rate', w: 2.22, align: 'right'}], rows, {rowH: 0.27, size: 10});
+  const bullets = [];
+  const forms = new Map(); d.errors.filter(r => r.kind === 'form' && r.d >= cut).forEach(r => { const k = (r.label || '(unnamed)') + (r.step ? ' step ' + r.step : ''); const o = forms.get(k) || {k, n: 0, det: new Map()}; o.n += r.events; if(r.detail) o.det.set(r.detail, (o.det.get(r.detail) || 0) + r.events); forms.set(k, o); });
+  const tf = [...forms.values()].sort((a, b) => b.n - a.n)[0];
+  if(tf) bullets.push('Most form errors: ' + tf.k + ' (' + int(tf.n) + ')' + ([...tf.det.entries()].sort((a, b) => b[1] - a[1])[0] ? ', most often \u201C' + clip([...tf.det.entries()].sort((a, b) => b[1] - a[1])[0][0], 70) + '\u201D' : '') + '.');
+  const cps = new Map(); d.errors.filter(r => r.kind === 'coupon' && r.d >= cut).forEach(r => { const o = cps.get(r.label) || {k: r.label, n: 0, raw: new Set()}; o.n += r.events; o.raw.add(r.raw_label); cps.set(r.label, o); });
+  const tc = [...cps.values()].sort((a, b) => b.n - a.n)[0];
+  if(tc) bullets.push('Most failed coupon: ' + tc.k + ' (' + int(tc.n) + ' attempts)' + (tc.raw.size > 1 ? ', typed ' + tc.raw.size + ' different ways (' + [...tc.raw].slice(0, 3).join(', ') + '), which may mean codes are case-sensitive.' : '.'));
+  const devs = [...new Set(d.funnel.map(r => r.device))].filter(x => x && x !== 'unknown');
+  const dr = devs.map(v => ({v, r: rate(last, 'purchase_sessions', 'checkout_sessions', v), n: sum(last, 'checkout_sessions', v)})).filter(x => x.r != null && x.n >= 100).sort((a, b) => b.r - a.r);
+  if(dr.length > 1) bullets.push('By device, checkout to bought is ' + dr.map(x => x.v + ' ' + pct(x.r, 0)).join(', ') + '. ' + (dr[0].r - dr[dr.length - 1].r > 0.1 ? 'The gap is worth testing on ' + dr[dr.length - 1].v + '.' : ''));
+  if(!bullets.length) bullets.push('No form or coupon errors recorded in the last 28 days.');
+  pNotes(s, end + 0.15, bullets.slice(0, 3));
+  pDone(s, ctx, 'Funnel counts visits once per step reached. Errors come from the site\u2019s error tracking, keeping only form and coupon errors and leaving out browser and third-party script noise.');
+  return true;
+}
+function slideSeo(pres, ctx){
+  const d = ctx.data.seo; if(!d) return false;
+  if(!d.ctr.length && !d.near.length && !d.drops.length) return false;
+  const gain = d.ctr.reduce((t, r) => t + r.ctr_gap_clicks, 0), pages = new Set(d.ctr.map(r => r.page)).size;
+  const weeks = [...new Set(d.daily.map(r => mondayOf(r.d)))].sort().slice(0, -1).slice(-8);
+  const nb = weeks.map(w => d.daily.filter(r => r.segment === 'Non-brand' && mondayOf(r.d) === w).reduce((t, r) => t + r.clicks, 0));
+  const rec = nb.slice(-4).reduce((a, b) => a + b, 0), pre = nb.slice(-8, -4).reduce((a, b) => a + b, 0);
+  const trend = pre ? (rec >= pre ? '+' : '\u2212') + Math.abs(Math.round(100 * (rec - pre) / pre)) + '%' : '\u2013';
+  const s = pBase(pres, 'Organic search wins', 'Search Console, last 28 days, brand searches left out', ctx.label);
+  const y = pCards(s, [
+    {label: 'PAGES TO REWRITE', value: String(pages), delta: 'top-five rankings', sub: 'low click-through for the position'},
+    {label: 'CLICKS TO WIN', value: int(gain), delta: 'a month', tone: 'good', sub: 'if titles matched our other pages'},
+    {label: 'WORTH A MONTH', value: d.rps ? gbpK(gain * d.rps) : '\u2013', delta: d.rps ? '\u00A3' + d.rps.toFixed(2) + ' per organic visit' : '', tone: 'good', sub: 'estimated sales'},
+    {label: 'CLOSE TO PAGE ONE', value: String(d.near.length), delta: 'positions 4 to 15', sub: '500+ impressions'},
+    {label: 'NON-BRAND CLICKS', value: trend, delta: 'last 4 weeks', tone: pre ? (rec >= pre ? 'good' : 'bad') : '', sub: 'against the 4 weeks before'}
+  ]);
+  const end = pTable(s, y + 0.2, [{label: 'Page', w: 4.0}, {label: 'Query', w: 2.9}, {label: 'Position', w: 1.2, align: 'right'}, {label: 'Click-through', w: 1.4, align: 'right'}, {label: 'Expected', w: 1.4, align: 'right'}, {label: 'Clicks to win', w: 1.52, align: 'right'}],
+    d.ctr.slice(0, 6).map(r => [clip(r.page, 52), clip(r.query, 38), r.avg_position.toFixed(1), pct(r.ctr), pct(r.expected_ctr), {text: int(r.ctr_gap_clicks), color: PPT.green, bold: true}]));
+  const bullets = [];
+  if(d.ctr.length) bullets.push('Ask: SEO/Content to rewrite the title and meta description on these ' + pages + ' ' + plural(pages, 'page', 'pages') + ', starting with ' + clip(d.ctr[0].page, 50) + ' (' + int(d.ctr[0].ctr_gap_clicks) + ' clicks a month).');
+  if(d.near.length) bullets.push(d.near.length + ' ' + plural(d.near.length, 'search sits', 'searches sit') + ' just off page one. Better copy and internal links from busy category pages can move them up.');
+  if(d.drops.length) bullets.push('Biggest loser: ' + clip(d.drops[0].page, 50) + ', ' + int(d.drops[0].clicks_cur) + ' clicks against ' + int(d.drops[0].clicks_prior) + ' in the previous 28 days (' + pct(d.drops[0].change_pct, 0) + '). Check indexing, redirects and recent changes.');
+  pNotes(s, end + 0.15, bullets.slice(0, 3));
+  pDone(s, ctx, 'Expected click-through at each position comes from our own non-brand pages. Page-level Search Console data starts in July 2026.');
+  return true;
+}
+function slideSearch(pres, ctx){
+  const d = ctx.data.search; if(!d || !d.sum) return false;
+  const rows = d.rows, sm = d.sum;
+  const miss = rows.filter(r => r.store_units > 0 && r.listed_online === false).sort((a, b) => b.searches - a.searches);
+  const zero = rows.filter(r => r.zero_searches >= 2).sort((a, b) => b.zero_searches - a.zero_searches);
+  const s = pBase(pres, 'Site search', 'What visitors search for  \u00B7  last 28 days, counted once per visit', ctx.label);
+  const y = pCards(s, [
+    {label: 'SEARCHES', value: int(sm.searches), delta: 'last 28 days', sub: 'one per visit, not per letter'},
+    {label: 'RETURN NOTHING', value: pct(sm.zero_searches / sm.searches, 0), delta: int(sm.zero_searches) + ' searches', tone: sm.zero_searches / sm.searches > 0.1 ? 'bad' : 'good', sub: 'no product suggested'},
+    {label: 'CLICK A PRODUCT', value: pct(sm.searches_with_click / sm.searches, 0), delta: 'went on to a product', sub: 'viewed or clicked after searching'},
+    {label: 'STORE-ONLY SEARCHES', value: String(miss.length), delta: int(miss.reduce((t, r) => t + r.searches, 0)) + ' searches', tone: miss.length ? 'bad' : 'good', sub: 'sold in store, not online'}
+  ]);
+  const show = (miss.length ? miss : zero).slice(0, 6);
+  const end = miss.length
+    ? pTable(s, y + 0.2, [{label: 'Search', w: 3.0}, {label: 'Searches', w: 1.6, align: 'right'}, {label: 'Store product', w: 5.8}, {label: 'Sold in store', w: 2.02, align: 'right'}], show.map(r => [clip(r.term, 36), int(r.searches), clip(r.store_product, 70), int(r.store_units)]))
+    : pTable(s, y + 0.2, [{label: 'Search', w: 5.0}, {label: 'Searches with no result', w: 3.7, align: 'right'}, {label: 'All searches', w: 3.72, align: 'right'}], show.map(r => [clip(r.term, 50), int(r.zero_searches), int(r.searches)]));
+  const bullets = [];
+  if(miss.length) bullets.push('Customers are searching for ' + miss.length + ' ' + plural(miss.length, 'product', 'products') + ' we only sell in store, led by \u201C' + clip(miss[0].term, 30) + '\u201D (' + int(miss[0].searches) + ' searches). These are shoppers asking for products we do not list.');
+  if(zero.length) bullets.push('Searches that return nothing, most often: ' + zero.slice(0, 5).map(r => '\u201C' + clip(r.term, 24) + '\u201D (' + r.zero_searches + ')').join(', ') + '. Add the product, a synonym or a redirect.');
+  bullets.push('The preview shows at most four products, so the no-result figure is a floor for what a full results page would show.');
+  pNotes(s, end + 0.15, bullets.slice(0, 3));
+  pDone(s, ctx, 'A typing sequence counts as one search when each entry extends the last within 20 seconds. Store matches compare the search with store product names.');
+  return true;
+}
+function slidePages(pres, ctx){
+  const d = ctx.data.products; if(!d) return false;
+  const flagged = d.rows.filter(r => r.merch_review).sort((a, b) => (b.est_gbp_week || 0) - (a.est_gbp_week || 0));
+  const fis = d.store || [], fisTotal = fis.reduce((t, r) => t + r.requests, 0);
+  if(!flagged.length && !fisTotal) return false;
+  const sum = flagged.reduce((t, r) => t + (r.est_gbp_week || 0), 0);
+  const stores = new Map(); fis.forEach(r => stores.set(r.store_name || '(unknown)', (stores.get(r.store_name || '(unknown)') || 0) + r.requests));
+  const topStore = [...stores.entries()].sort((a, b) => b[1] - a[1])[0];
+  const prods = new Map(); fis.forEach(r => { const k = r.product_name || '(unknown)'; const o = prods.get(k) || {name: k, id: r.product_group_id, n: 0}; o.n += r.requests; if(!o.id) o.id = r.product_group_id; prods.set(k, o); });
+  const topProd = [...prods.values()].sort((a, b) => b.n - a.n)[0];
+  const s = pBase(pres, 'Product pages to fix', 'Popular pages that lose visitors before the basket  \u00B7  last 28 days', ctx.label);
+  const y = pCards(s, [
+    {label: 'PAGES FLAGGED', value: String(flagged.length), delta: 'well below category', tone: flagged.length ? 'bad' : 'good', sub: 'busy pages, weak add to basket'},
+    {label: 'WORTH A WEEK', value: sum ? gbpK(sum) : '\u2013', delta: 'if they matched the median', tone: 'good', sub: 'estimated sales'},
+    {label: 'FIND IN STORE', value: int(fisTotal), delta: 'clicks, 28 days', sub: 'on ' + prods.size + ' ' + plural(prods.size, 'product', 'products')},
+    {label: 'TOP SHOWROOM', value: topStore ? topStore[0] : '\u2013', delta: topStore ? int(topStore[1]) + ' requests' : '', sub: 'for find in store'}
+  ]);
+  const end = pTable(s, y + 0.2, [{label: 'Product', w: 4.4}, {label: 'Category', w: 2.0}, {label: 'Visits', w: 1.4, align: 'right'}, {label: 'Add to basket', w: 1.5, align: 'right'}, {label: 'Category median', w: 1.6, align: 'right'}, {label: 'Worth a week', w: 1.52, align: 'right'}],
+    flagged.slice(0, 6).map(r => [clip(r.name, 56), clip(r.category, 26), int(r.pdp_sessions), pct(r.cart_rate), pct(r.peer_median_cart_rate), {text: gbp(r.est_gbp_week), color: PPT.green, bold: true}]));
+  const bullets = [];
+  if(flagged.length) bullets.push('Ask: eCommerce to open each flagged page as a customer and check price, delivery time, images, dimensions and options. The first is ' + clip(flagged[0].name, 50) + ' (' + pct(flagged[0].cart_rate) + ' add to basket against ' + pct(flagged[0].peer_median_cart_rate) + ' for the category).');
+  if(topProd) bullets.push('Most find-in-store requests: ' + clip(topProd.name, 55) + ' (' + int(topProd.n) + '). A product with many requests and a low add-to-basket rate may be one customers want to try first; a swatch or showroom prompt can help.');
+  bullets.push('Made-to-order products convert differently from in-stock ones and the feed cannot separate them yet, so treat a flag as a prompt to look, not a verdict.');
+  pNotes(s, end + 0.15, bullets.slice(0, 3));
+  pDone(s, ctx, 'A page is flagged when it is in the top fifth of its category for visits and its add-to-basket rate is under half the category median.');
+  return true;
+}
+const SLIDE_BUILDERS = {intro: slideIntro, add: slideAdd, groups: slideGroups, alerts: slideAlerts, checkout: slideCheckout, seo: slideSeo, search: slideSearch, pages: slidePages};
+
+async function exportSlides(sel, label, withNotes, onStatus){
+  onStatus('Loading the slide library\u2026');
+  await loadPptx();
+  const keys = [...new Set(SLIDE_OPTIONS.filter(o => sel.includes(o[0])).flatMap(o => o[3]))];
+  onStatus('Loading the data for the slides\u2026');
+  await Promise.all(keys.map(k => { const c = startLoad(k); return c.promise || Promise.resolve(); }));
+  const data = {}, unavailable = [];
+  keys.forEach(k => { const c = cache[k]; if(c && c.status === 'ok') data[k] = c.data; else unavailable.push(TABS[k].label); });
+  onStatus('Building the slides\u2026');
+  const pres = new window.PptxGenJS(); pres.defineLayout({name: 'BS_WIDE', width: 13.3333333, height: 7.5}); pres.layout = 'BS_WIDE'; pres.title = 'Opportunities and Optimisations'; pres.author = 'Barker and Stonehouse';
+  const ctx = {label, notes: withNotes, data};
+  const made = [], empty = [];
+  SLIDE_OPTIONS.forEach(([id, name]) => { if(!sel.includes(id)) return; (SLIDE_BUILDERS[id](pres, ctx) ? made : empty).push(name); });
+  if(!made.length) throw new Error('None of the chosen slides had data to show.');
+  const stamp = new Date().toISOString().slice(0, 10);
+  await pres.writeFile({fileName: 'Opportunities-' + stamp + '.pptx'});
+  return {made, empty, unavailable};
+}
+function openExport(){
+  const dlg = $('#exportDlg'); if(!dlg.showModal) return;
+  $('#exportList').innerHTML = SLIDE_OPTIONS.map(o => '<label class="opt"><input type="checkbox" name="sl" value="' + o[0] + '" checked><span><b>' + esc(o[1]) + '</b><small>' + esc(o[2]) + '</small></span></label>').join('');
+  $('#exportLabel').value = 'Opportunities  \u00B7  ' + new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'short', year: 'numeric'});
+  $('#exportMsg').textContent = ''; $('#exportGo').disabled = false;
+  dlg.showModal();
+}
+function wireExport(){
+  const dlg = $('#exportDlg'); if(!dlg) return;
+  $('#exportCancel').addEventListener('click', () => dlg.close());
+  $('#exportGo').addEventListener('click', async () => {
+    const sel = [...document.querySelectorAll('#exportList input:checked')].map(i => i.value), msg = $('#exportMsg'), go = $('#exportGo');
+    if(!sel.length){ msg.textContent = 'Choose at least one slide.'; return; }
+    go.disabled = true;
+    try {
+      const r = await exportSlides(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportNotes').checked, t => { msg.textContent = t; });
+      msg.textContent = 'Downloaded ' + r.made.length + ' ' + plural(r.made.length, 'slide', 'slides') + '.' + (r.empty.length ? ' Left out because there was nothing to show: ' + r.empty.join(', ') + '.' : '') + (r.unavailable.length ? ' Could not load: ' + r.unavailable.join(', ') + '.' : '') + ' Open the file, copy the slides and paste them at the end of the deck.';
+    } catch(e) { msg.textContent = 'Could not make the slides: ' + (e && e.message ? e.message : e); }
+    go.disabled = false;
+  });
+}
+
 /* ---------- start ---------- */
-buildShell();
+buildShell(); wireExport();
 window.__app = {state, cache, render, showView, loadDemo, renderActions, renderSeo, renderLanding, renderSearch, renderLists, renderProducts, renderCheckout, renderJourneys, renderHealth, drawWeekly, TABS};
 if(state.demo){ loadDemo(); render(); }
 else if(clientIdMissing()){ showGate(); }
