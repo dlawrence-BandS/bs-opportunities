@@ -1390,12 +1390,12 @@ function renderHealth(el, h){
     fresh('GA4 export', h.ga4Latest, 2, 4, 'The daily export lands the next morning.') +
     (h.feedLoaded ? fresh('Product feed table', h.feedLoaded, 7, 21, 'Reload the feed so new products are included.') : '') + '</tbody></table></div>');
   if(h.capture && h.capture.raw_capture != null){
-    const cr = h.capture.raw_capture, cl = cr >= 0.95 ? 'good' : cr >= 0.85 ? 'check' : 'fix';
-    html += sec('Does GA4 record every online order?', 'GA4 recorded ' + (100 * cr).toFixed(0) + '% of the online orders in Ometria from ' + dmy(h.capture.ws) + ' to ' + dmy(h.capture.we) + '. Online units on Store gap are scaled up to allow for the rest (by ' + (100 * (1 / h.capture.factor_applied - 1)).toFixed(0) + '%). Conversion figures from GA4 are not scaled.',
+    const wk4 = (h.captureWk || []).slice(-4), cr0 = h.capture.raw_capture, cr = wk4.length ? wk4.reduce((t, r) => t + r.ga4_orders, 0) / Math.max(1, wk4.reduce((t, r) => t + r.ometria_orders, 0)) : cr0, cl = cr >= 0.95 ? 'good' : cr >= 0.85 ? 'check' : 'fix';
+    html += sec('Does GA4 record every online order?', 'GA4 recorded ' + (100 * cr0).toFixed(0) + '% of the online orders in Ometria from ' + dmy(h.capture.ws) + ' to ' + dmy(h.capture.we) + ', and ' + (100 * cr).toFixed(0) + '% over the last four weeks. Online units on Store gap are scaled up to allow for the rest (by ' + (100 * (1 / h.capture.factor_applied - 1)).toFixed(0) + '%). Conversion figures from GA4 are not scaled.',
       tbl([{label: 'Week starting', get: r => dm(r.wk)}, {label: 'GA4 orders', num: true, get: r => int(r.ga4_orders)}, {label: 'Ometria online orders', num: true, get: r => int(r.ometria_orders)}, {label: 'GA4 as a share of Ometria', num: true, get: r => pct(r.capture, 0)},
            {label: 'Status', get: r => r.capture >= 0.95 ? pill('good') : r.capture >= 0.85 ? pill('check') : pill('fix')}],
         (h.captureWk || []).slice(-8), {limit: 8, empty: 'No complete weeks to compare yet.'}) +
-      '<p class="foot">Overall status for the period: ' + pill(cl) + '. A drop usually means consent, ad blockers or a payment redirect is stopping the purchase event.</p>');
+      '<p class="foot">Status over the last four weeks: ' + pill(cl) + '. A drop usually means consent, ad blockers or a payment redirect is stopping the purchase event.</p>');
   }
   const m = h.mapped, ml = m == null ? 'fix' : m >= 0.95 ? 'good' : m >= 0.9 ? 'check' : 'fix';
   html += sec('Do store products match the website?', 'The share of store sales that lands on a product model in the feed. The opportunity list is reliable from 95%.',
@@ -1465,7 +1465,8 @@ function todoSection(h){
     if(h.feed.no_type) t.push({who: 'Feedonomics', what: 'Add a product type to ' + int(h.feed.no_type) + ' feed rows.', why: 'Products without a category cannot be compared with similar products.'});
     if(h.feed.home_links) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.home_links) + ' feed rows that link to the homepage.', why: 'Shopping ads for these products land on the homepage, not the product page.'});
   }
-  if(h.capture && h.capture.raw_capture != null && h.capture.raw_capture < 0.9) t.push({who: 'Developer', what: 'GA4 records about ' + (100 * h.capture.raw_capture).toFixed(0) + '% of online orders. Check consent mode, ad blockers and the purchase event on the order confirmation page and any payment redirects.', why: 'Every GA4 sales figure is under-counted. The dashboard scales online units to compensate, but conversion and channel figures are not.'});
+  const cw4 = (h.captureWk || []).slice(-4), crec = cw4.length ? cw4.reduce((t, r) => t + r.ga4_orders, 0) / Math.max(1, cw4.reduce((t, r) => t + r.ometria_orders, 0)) : (h.capture ? h.capture.raw_capture : null);
+  if(crec != null && crec < 0.9) t.push({who: 'Developer', what: 'GA4 has recorded about ' + (100 * crec).toFixed(0) + '% of online orders over the last four weeks. Check consent mode, ad blockers and the purchase event on the order confirmation page and any payment redirects.', why: 'Every GA4 sales figure is under-counted. The dashboard scales online units to compensate, but conversion and channel figures are not.'});
   const ev = Object.fromEntries((h.tracking || []).map(r => [r.event_name, r]));
   if(!ev.view_item_list || !ev.view_item_list.events) t.push({who: 'Developer', what: 'Send view_item_list and item_list_index on product lists.', why: 'Without them Product lists cannot show which positions underperform.'});
   if(ev.sample_order && ev.sample_order.events) t.push({who: 'Developer', what: 'Add the product being viewed to the swatch request (sample_order) event.', why: 'It records the fabric only, so swatch requests cannot be tied to products.'});
