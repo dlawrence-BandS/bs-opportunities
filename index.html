@@ -260,6 +260,7 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
   <div id="exportList" class="optlist"></div>
   <label class="field">Label, top right of each slide<input id="exportLabel" type="text"></label>
   <label class="field">Due date shown against each action<input id="exportDue" type="text"></label>
+  <label class="field">Category for the Category focus slide<input id="exportCat" type="text" value="Sofas"></label>
   <label class="field">Items per list on the checklist<input id="exportPer" type="number" min="5" max="200" value="10"></label>
   <label class="check"><input type="checkbox" id="exportNotes" checked> Add speaker notes</label>
   <p id="exportMsg" class="exportmsg" role="status"></p>
@@ -400,8 +401,8 @@ FROM f`,
   shopSummary: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, impressions, clicks, cost, conversions, conv_value, cost_matched, oos_cost FROM ${T('bs_marts.shopping_summary_28d')}`,
   shopModels: `SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, impressions, clicks, cost, conversions, conv_value, roas, oos_clicks, oos_cost, store_units, gap_segment FROM ${T('bs_marts.shopping_by_model_28d')} ORDER BY cost DESC LIMIT 3000`,
   shopGaps: `SELECT product_group_id AS id, product_name AS name, store_units, store_revenue, gap_segment, shopping_impressions FROM ${T('bs_marts.shopping_store_gaps_28d')} ORDER BY store_revenue DESC LIMIT 100`,
-  dimMap: `SELECT product_group_id AS id, category, section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
-  dimMapBasic: `SELECT product_group_id AS id, category, '' AS section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
+  dimMap: `SELECT product_group_id AS id, category, broad_category, section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
+  dimMapBasic: `SELECT product_group_id AS id, category, '' AS broad_category, '' AS section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
   seasonality: `SELECT section, month_of_year, idx, months_covered, peak_ratio, yearly_views FROM ${T('bs_marts.category_seasonality')}`,
   capture: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, ga4_orders, ometria_orders, raw_capture, factor_applied FROM ${T('bs_marts.ga4_capture')}`,
   captureWeekly: `SELECT CAST(wk AS STRING) AS wk, ga4_orders, ometria_orders, capture FROM ${T('bs_marts.ga4_capture_weekly')} ORDER BY wk`,
@@ -1049,6 +1050,20 @@ function contextHealth(){
     tbl([{label: 'Check', get: r => esc(r[0])}, {label: 'Result', get: r => esc(r[1])}, {label: 'Status', get: r => pill(r[2])}, {label: 'Note', get: r => esc(r[3]), cls: 'name'}], rows, {limit: 5}));
 }
 
+/* category of an item, for the category filter, the checklist and the Category focus slide */
+const normPath = p => { const x = String(p || '').split('?')[0].split('#')[0].replace(/\/+$/, '').toLowerCase(); return x || '/'; };
+function catOf(o){
+  const d = (o.id && CTX.dim.get(o.id)) || (o.path && CTX.pathDim.get(normPath(o.path))) || null;
+  return (d && (d.broad_category || d.category)) || o.category || '';
+}
+function catGuess(text){
+  const t = String(text || '').toLowerCase(); if(!t) return '';
+  if(!CTX._cn || CTX._cnSize !== CTX.dim.size){ const n = new Set(); CTX.dim.forEach(v => { if(v.broad_category) n.add(v.broad_category); }); CTX._cn = [...n]; CTX._cnSize = CTX.dim.size; }
+  let best = '', len = 0;
+  CTX._cn.forEach(n => { const stem = n.toLowerCase().replace(/s$/, ''); if(stem.length >= 4 && stem.length > len && t.includes(stem)){ best = n; len = stem.length; } });
+  return best;
+}
+
 const GROUPS = [['Start', ['overview', 'actions']], ['Products', ['opps', 'products', 'lists', 'search']], ['Traffic', ['seo', 'landing', 'shopping']], ['Customers', ['checkout', 'journeys']], ['System', ['health', 'guide']]];
 const TAB_ORDER = GROUPS.flatMap(g => g[1]);
 const TABS = {
@@ -1391,6 +1406,7 @@ function actionRowsAll(d){
     const o = {...r, gbp: r.est_gbp_week != null ? r.est_gbp_week : (r.est_clicks_week != null && d.rps ? r.est_clicks_week * d.rps : null), confirmed: r.run_count >= 2 || r.priority === 'P1'};
     const isPath = String(r.entity_name).startsWith('/');
     const c = ctxFor({id: isPath ? '' : r.entity_id, name: r.entity_name, path: isPath ? r.entity_name : ''});
+    o.category = catOf({id: isPath ? '' : r.entity_id, path: isPath ? r.entity_name : ''}) || catGuess(r.entity_name);
     if(c){ o.aside = true; o.ctx = c; }
     return o;
   });
@@ -1398,8 +1414,8 @@ function actionRowsAll(d){
 function actionRows(d){ return actionRowsAll(d).filter(r => !r.aside); }
 function renderActions(el, d){
   const rows = actionRows(d);
-  const owners = [...new Set(rows.map(r => r.owner_pillar))].sort();
-  let list = rows.filter(r => (!state.act.confirmedOnly || r.confirmed) && (!state.act.owner || r.owner_pillar === state.act.owner));
+  const owners = [...new Set(rows.map(r => r.owner_pillar))].sort(), cats = [...new Set(rows.map(r => r.category).filter(Boolean))].sort();
+  let list = rows.filter(r => (!state.act.confirmedOnly || r.confirmed) && (!state.act.owner || r.owner_pillar === state.act.owner) && (!state.act.cat || r.category === state.act.cat));
   list.sort((a, b) => (a.priority === 'P1' ? 0 : 1) - (b.priority === 'P1' ? 0 : 1) || (b.gbp || 0) - (a.gbp || 0));
   const total = list.reduce((t, r) => t + (r.gbp || 0), 0), urgent = list.filter(r => r.priority === 'P1').length;
   const key = r => 'a:' + r.rule_code + ':' + r.entity_id;
@@ -1415,6 +1431,7 @@ function renderActions(el, d){
   el.innerHTML = lede(list.length ? list.length + ' ' + plural(list.length, 'thing needs', 'things need') + ' attention' + (total ? ', worth about ' + gbpK(total) + ' a week if fixed.' : '.') : 'No confirmed alerts right now.',
       urgent ? urgent + ' ' + plural(urgent, 'is', 'are') + ' urgent. Start there.' : 'Nothing is urgent. Work down by value.') +
     '<div class="filters"><label class="sr" for="own">Owner</label><select id="own"><option value="">All owners</option>' + owners.map(o => '<option' + (state.act.owner === o ? ' selected' : '') + '>' + esc(o) + '</option>').join('') + '</select>' +
+    '<label class="sr" for="actcat">Category</label><select id="actcat"><option value="">All categories</option>' + cats.map(c => '<option' + (state.act.cat === c ? ' selected' : '') + '>' + esc(c) + '</option>').join('') + '</select>' +
     '<label class="check"><input type="checkbox" id="conf"' + (state.act.confirmedOnly ? ' checked' : '') + '> Confirmed alerts only</label>' +
     '<button type="button" class="btn quiet" id="acsv">Download CSV</button></div>' +
     (d.seoErr ? '<div class="banner"><strong>Search alerts are missing.</strong> Run 02_build_eu_search-console.sql once to add them. BigQuery said: ' + esc(d.seoErr.message) + '</div>' : '') +
@@ -1423,6 +1440,7 @@ function renderActions(el, d){
     '<p class="foot">Search alerts show clicks priced at your organic revenue per visit' + (d.rps ? ' (\u00A3' + d.rps.toFixed(2) + ')' : '') + '. Product alerts use your own baskets and prices.</p>';
   decorate(el, 'actions');
   $('#own', el).addEventListener('change', e => { state.act.owner = e.target.value; renderActions(el, d); });
+  $('#actcat', el).addEventListener('change', e => { state.act.cat = e.target.value; renderActions(el, d); });
   $('#conf', el).addEventListener('change', e => { state.act.confirmedOnly = e.target.checked; renderActions(el, d); });
   $('#acsv', el).addEventListener('click', () => {
     const q = v => v == null ? '' : '"' + String(v).replace(/"/g, '""') + '"';
@@ -1831,6 +1849,7 @@ const PPT = {navy: '1F3864', head: '2F4F8F', mid: 'C7D2E8', line: 'D5DAE3', ink:
 const SLIDE_OPTIONS = [
   ['intro',  'Section title',                          'An opening slide for the Opportunities section', []],
   ['plan',   'Actions for this week',                  'One page: every action with the products or pages, the owner and the date', ['actions', 'seo']],
+  ['category', 'Category focus',                       'Everything the dashboard found for one category, typed below (for example Sofas)', ['actions', 'checkout', 'seo', 'search', 'products']],
   ['add',    'Add products to the website',            'The biggest products sold in store and missing online, with the three actions to add them', []],
   ['groups', 'Where the rest of the opportunity sits', 'Products to make findable, fix and push, with what to do and who owns it', []],
   ['alerts', 'Alerts to action',                       'Confirmed alerts with the evidence and the action for each', ['actions']],
@@ -1949,6 +1968,34 @@ const panelY = (tableEnd, n) => Math.min(tableEnd + 0.2, 7.3 - (0.42 + Math.min(
 const maxRows = (start, n, rowH) => Math.max(2, Math.floor((7.3 - (0.42 + Math.min(n, 3) * 0.5) - 0.2 - start - 0.3) / rowH));
 const head2 = (t, n) => clip(t, n || 56);
 
+function catItems(data, cat){
+  const all = checklistItems(['add', 'groups', 'alerts', 'checkout', 'seo', 'search', 'pages'], data, 100);
+  const stem = cat.toLowerCase().replace(/s$/, '');
+  return all.filter(it => (it.category || '').toLowerCase().includes(stem) || String(it.item).toLowerCase().includes(stem) || String(it.evidence || '').toLowerCase().includes(stem));
+}
+function slideCategory(pres, ctx){
+  const cat = (ctx.cat || '').trim(); if(!cat) return false;
+  const items = catItems(ctx.data, cat); if(!items.length) return false;
+  const rank = {'Alerts to action': 0, 'Add products to the website': 1, 'Fix, find and push': 2, 'Product pages to fix': 3, 'Organic search wins': 4, 'Site search': 5, 'Checkout health': 6};
+  items.sort((a, b) => (rank[a.slide] != null ? rank[a.slide] : 9) - (rank[b.slide] != null ? rank[b.slide] : 9));
+  const by = n => items.filter(i => i.slide === n).length, name = cat.charAt(0).toUpperCase() + cat.slice(1);
+  const alerts = by('Alerts to action'), gaps = by('Add products to the website') + by('Fix, find and push'), pages = by('Product pages to fix') + by('Organic search wins') + by('Site search');
+  const s = pBase(pres, name + ': what the dashboard found', 'Everything that touches ' + cat.toLowerCase() + ' in the dashboard  \u00B7  ' + items.length + ' ' + plural(items.length, 'item', 'items') + ' to look at', ctx.label);
+  const y = pCards(s, [
+    {label: 'ITEMS FOUND', value: String(items.length), delta: 'for ' + cat.toLowerCase(), sub: 'across every area'},
+    {label: 'ALERTS', value: String(alerts), delta: alerts ? 'to action' : 'none', tone: alerts ? 'bad' : 'good', sub: 'from the nightly checks'},
+    {label: 'STORE GAPS', value: String(gaps), delta: plural(gaps, 'product', 'products'), sub: 'add, find, fix or push'},
+    {label: 'PAGES AND SEARCH', value: String(pages), delta: 'to review', sub: 'product pages, search, SEO'}
+  ]);
+  const acts = [], seen = new Set();
+  items.forEach(it => { const k = it.action; if(acts.length < 3 && !seen.has(k)){ seen.add(k); acts.push({lead: it.action + ': ' + clip(it.item, 36), rest: clip(it.what, 110), owner: it.owner}); } });
+  const rows = items.slice(0, maxRows(y + 0.2, acts.length, 0.3));
+  const end = pTable(s, y + 0.2, [{label: 'Area', w: 2.0}, {label: 'Action', w: 2.7}, {label: 'Item', w: 3.9}, {label: 'Owner', w: 1.5}, {label: 'Worth (est.)', w: 2.32}],
+    rows.map(it => [clip(it.slide, 26), clip(it.action, 34), {text: clip(it.item, 50), color: PPT.ink, bold: true}, clip(it.owner, 18), {text: clip(it.worth, 36), color: PPT.green, bold: true}]), {size: 10});
+  pActions(s, panelY(end, acts.length), acts, ctx.due);
+  pDone(s, ctx, 'This slide gathers everything the dashboard found for ' + cat.toLowerCase() + ': store gaps, alerts, product pages, search and SEO. It shows what we can act on. It does not explain why the week\u2019s sales moved; the category slides in the pack cover that. Items are matched by category, or by the word in the product or page name.');
+  return true;
+}
 function slidePlan(pres, ctx){
   const per = periodText(), rows = [];
   const add = segList('1 Not listed online');
@@ -2185,7 +2232,7 @@ function slidePages(pres, ctx){
   return true;
 }
 
-const SLIDE_BUILDERS = {intro: slideIntro, plan: slidePlan, add: slideAdd, groups: slideGroups, alerts: slideAlerts, checkout: slideCheckout, seo: slideSeo, search: slideSearch, pages: slidePages};
+const SLIDE_BUILDERS = {intro: slideIntro, plan: slidePlan, category: slideCategory, add: slideAdd, groups: slideGroups, alerts: slideAlerts, checkout: slideCheckout, seo: slideSeo, search: slideSearch, pages: slidePages};
 
 async function exportSlides(sel, label, withNotes, due, onStatus){
   onStatus('Loading the slide library\u2026');
@@ -2197,7 +2244,7 @@ async function exportSlides(sel, label, withNotes, due, onStatus){
   keys.forEach(k => { const c = cache[k]; if(c && c.status === 'ok') data[k] = c.data; else unavailable.push(TABS[k].label); });
   onStatus('Building the slides\u2026');
   const pres = new window.PptxGenJS(); pres.defineLayout({name: 'BS_WIDE', width: 13.3333333, height: 7.5}); pres.layout = 'BS_WIDE'; pres.title = 'Opportunities and Optimisations'; pres.author = 'Barker and Stonehouse';
-  const ctx = {label, notes: withNotes, data, due};
+  const ctx = {label, notes: withNotes, data, due, cat: ($('#exportCat') && $('#exportCat').value.trim()) || ''};
   const made = [], empty = [];
   SLIDE_OPTIONS.forEach(([id, name]) => { if(!sel.includes(id)) return; (SLIDE_BUILDERS[id](pres, ctx) ? made : empty).push(name); });
   if(!made.length) throw new Error('None of the chosen slides had data to show.');
@@ -2215,7 +2262,8 @@ async function loadExcelJs(){
 }
 function checklistItems(sel, data, perList){
   const items = [], per = periodText(), site = p => p ? CONFIG.SITE + p : '', cap = a => a.slice(0, perList);
-  const push = (slide, action, type, o) => items.push({slide, action, type, item: o.item, code: o.code || '', link: o.link || '', owner: o.owner || '', worth: o.worth || '', what: o.what || '', evidence: o.evidence || ''});
+  const catForItem = o => catOf({id: o.code, path: o.link ? normPath(String(o.link).replace(CONFIG.SITE, '')) : '', category: o.category}) || catGuess((o.item || '') + ' ' + (o.evidence || ''));
+  const push = (slide, action, type, o) => items.push({slide, action, type, category: catForItem(o), item: o.item, code: o.code || '', link: o.link || '', owner: o.owner || '', worth: o.worth || '', what: o.what || '', evidence: o.evidence || ''});
   const has = id => sel.includes(id);
   if(has('add')){
     segList('1 Not listed online').forEach(r => { const x = explainRow(r);
@@ -2284,12 +2332,12 @@ function buildChecklistWorkbook(items, label, due, perList, aside){
   const sm = wb.addWorksheet('Summary', {views: [{showGridLines: false}]});
   const ck = wb.addWorksheet('Checklist', {views: [{state: 'frozen', xSplit: 1, ySplit: 1}]});
   /* checklist sheet */
-  const cols = [['Status', 15], ['Action', 26], ['Item', 40], ['Owner', 18], ['Due', 11], ['Worth (est.)', 18], ['What to do', 48], ['Notes', 24], ['Date done', 12], ['Done by', 13], ['Slide', 26], ['Type', 14], ['Code', 15], ['Link', 34], ['Evidence', 56]];
+  const cols = [['Status', 15], ['Action', 26], ['Item', 40], ['Owner', 18], ['Due', 11], ['Worth (est.)', 18], ['What to do', 48], ['Notes', 24], ['Date done', 12], ['Done by', 13], ['Slide', 26], ['Type', 14], ['Code', 15], ['Link', 34], ['Evidence', 56], ['Category', 22]];
   ck.columns = cols.map(([header, width]) => ({header, width}));
   const hr = ck.getRow(1); hr.height = 24;
   hr.eachCell(c => { c.font = {name: 'Calibri', bold: true, color: {argb: 'FFFFFFFF'}, size: 11}; c.fill = {type: 'pattern', pattern: 'solid', fgColor: {argb: HEAD}}; c.alignment = {vertical: 'middle', wrapText: true}; c.border = border; });
   items.forEach((it, i) => {
-    const r = ck.addRow([TICK.todo, it.action, it.item, it.owner, due, it.worth, it.what, '', '', '', it.slide, it.type, it.code, '', it.evidence]);
+    const r = ck.addRow([TICK.todo, it.action, it.item, it.owner, due, it.worth, it.what, '', '', '', it.slide, it.type, it.code, '', it.evidence, it.category || '']);
     r.alignment = {vertical: 'top', wrapText: true}; r.font = {name: 'Calibri', size: 10.5};
     r.eachCell({includeEmpty: true}, c => { c.border = border; });
     r.getCell(1).font = {name: 'Calibri', size: 11, bold: true};
@@ -2299,9 +2347,9 @@ function buildChecklistWorkbook(items, label, due, perList, aside){
   });
   const last = Math.max(items.length + 1, 2);
   ck.dataValidations.add('A2:A' + last, {type: 'list', allowBlank: false, showErrorMessage: true, errorTitle: 'Choose a status', error: 'Pick a status from the list.', formulae: ['"' + [TICK.todo, TICK.doing, TICK.done, TICK.skip].join(',') + '"']});
-  ck.autoFilter = {from: 'A1', to: 'O' + last};
+  ck.autoFilter = {from: 'A1', to: 'P' + last};
   const fill = argb => ({type: 'pattern', pattern: 'solid', bgColor: {argb}});
-  ck.addConditionalFormatting({ref: 'A2:O' + last, rules: [
+  ck.addConditionalFormatting({ref: 'A2:P' + last, rules: [
     {type: 'expression', priority: 1, formulae: ['$A2="' + TICK.done + '"'], style: {fill: fill('FFE2F0D9'), font: {color: {argb: GREY}}}},
     {type: 'expression', priority: 2, formulae: ['$A2="' + TICK.doing + '"'], style: {fill: fill('FFFFF2CC')}},
     {type: 'expression', priority: 3, formulae: ['$A2="' + TICK.skip + '"'], style: {fill: fill('FFEDEDED'), font: {color: {argb: 'FF8C8C8C'}}}}
@@ -2341,6 +2389,15 @@ function buildChecklistWorkbook(items, label, due, perList, aside){
     return [o, '=COUNTIFS(' + q + ')', '=COUNTIFS(' + q + ',Checklist!$A$2:$A$' + n + ',"' + TICK.done + '")', '=IF(B' + rr + '=0,0,C' + rr + '/B' + rr + ')']; });
   table(r1, 'Progress by owner', ['Owner', 'Items', 'Done', '% done'], rowsO);
   for(let i = 0; i < owners.length; i++) sm.getCell('D' + (r1 + 2 + i)).numFmt = '0%';
+  const cnt = {}; items.forEach(it => { if(it.category) cnt[it.category] = (cnt[it.category] || 0) + 1; });
+  const catList = Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 12).map(x => x[0]);
+  if(catList.length){
+    const r2 = r1 + 2 + owners.length + 2;
+    const rowsC = catList.map((c, i) => { const rr = r2 + 2 + i, q = 'Checklist!$P$2:$P$' + n + ',$A' + rr;
+      return [c, '=COUNTIFS(' + q + ')', '=COUNTIFS(' + q + ',Checklist!$A$2:$A$' + n + ',"' + TICK.done + '")', '=IF(B' + rr + '=0,0,C' + rr + '/B' + rr + ')']; });
+    table(r2, 'Items by category', ['Category', 'Items', 'Done', '% done'], rowsC);
+    for(let i = 0; i < catList.length; i++) sm.getCell('D' + (r2 + 2 + i)).numFmt = '0%';
+  }
   sm.pageSetup = {orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9};
   if(aside && aside.length){
     const as = wb.addWorksheet('Set aside');
