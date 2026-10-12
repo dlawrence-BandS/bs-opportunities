@@ -222,6 +222,8 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 .dlgact{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px}
 .btn:disabled{opacity:.6;cursor:wait}
 .status #exportBtn{background:var(--ink);color:#fff;border-color:var(--ink)}
+.ver{color:var(--muted);font-size:.8rem;padding:8px 0 40px}
+@media print{.ver{display:none}}
 </style>
 </head>
 <body>
@@ -244,6 +246,7 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 </main>
 <noscript><div class="wrap"><p>This dashboard needs JavaScript to load its data.</p></div></noscript>
 
+<footer id="ver" class="wrap ver"></footer>
 <dialog id="exportDlg" aria-labelledby="exportTitle">
   <h2 id="exportTitle">Export slides for the Monday meeting</h2>
   <p class="sub">Downloads a PowerPoint in the style of the Weekly Performance Pack. Every slide names the products or pages involved, and ends with numbered actions, an owner and a due date. Open it, copy the slides you want and paste them at the end of the deck. The checklist is an Excel file listing every product, page and search term behind the chosen slides, with a status dropdown for the team to tick off.</p>
@@ -1428,8 +1431,10 @@ async function loadHealth(){
   const keys = ['ordersLatest','ga4Latest','feed','mapped','tracking','buildLog'];
   const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge), bq(SQL.shopSummary)]);
   failIfAuth(rs);
+  const labels = ['Ometria orders', 'GA4 export', 'Product feed', 'Store products matching', 'Website tracking', 'Main build log', 'Search Console build log', 'GA4 order capture', 'GA4 order capture by week', 'Product feed age', 'Google Ads matching'];
+  const failed = rs.map((r, i) => r.status === 'rejected' ? {label: labels[i] || ('Check ' + i), msg: r.reason && r.reason.message ? r.reason.message : String(r.reason)} : null).filter(Boolean);
   const v = i => val(rs[i]);
-  return {ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0]};
+  return {failed, ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0]};
 }
 function renderHealth(el, h){
   const fresh = (label, latest, okDays, warnDays, note) => {
@@ -1521,6 +1526,7 @@ function renderGuide(el){
 
 function todoSection(h){
   const t = [];
+  (h.failed || []).forEach(f => t.push({who: 'Dan', what: 'The "' + f.label + '" check could not run, so its section is missing. BigQuery said: ' + String(f.msg).slice(0, 240) + '. Send this message to Claude.', why: 'Until it runs, that part of the page cannot tell you whether the data is healthy.'}));
   (h.buildLog || []).concat(h.gscLog || []).filter(r => r.status !== 'ok').forEach(r => t.push({who: 'Dan', what: 'Build step ' + r.step + ' failed: ' + (r.message || 'no message') + '. Send the message to Claude to fix.', why: 'The tab that uses it will be empty or out of date.'}));
   const age = daysBehind(h.ordersLatest); if(age == null || age > 8) t.push({who: 'Dan', what: 'Reload Ometria orders into BigQuery' + (age != null ? ' (the data is ' + age + ' days old)' : '') + '.', why: 'Weekly sales and the online share are wrong without it.'});
   const fage = h.feedLoaded ? daysBehind(h.feedLoaded) : null; if(fage != null && fage > 14) t.push({who: 'Dan', what: 'Reload the product feed table in BigQuery (it is ' + fage + ' days old).', why: 'Products added since then will wrongly show as not on the website, and new prices and stock are missed.'});
@@ -2097,7 +2103,9 @@ function wireExport(){
 }
 
 /* ---------- start ---------- */
+const VERSION = '12 Oct 2026';
 buildShell(); wireExport();
+$('#ver').textContent = 'Opportunities dashboard, version ' + VERSION + '. If this date is older than the latest file you were sent, copy the new index.html over the old one.';
 window.__app = {state, cache, render, showView, loadDemo, renderActions, renderSeo, renderLanding, renderSearch, renderLists, renderProducts, renderCheckout, renderJourneys, renderHealth, drawWeekly, TABS};
 if(state.demo){ loadDemo(); render(); }
 else if(clientIdMissing()){ showGate(); }
