@@ -375,13 +375,19 @@ FROM ${T('bs_marts.checkout_funnel_daily')} ORDER BY d`,
 SELECT MAX(_TABLE_SUFFIX) AS latest FROM ${T('analytics_287404213.events_*')}
 WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)) AND FORMAT_DATE('%Y%m%d', CURRENT_DATE())`,
   feed: `
-SELECT COUNT(*) AS feed_rows,
-  COUNTIF(product_type IS NULL OR TRIM(product_type) = '') AS no_type,
-  COUNTIF(RTRIM(link, '/') = 'https://www.barkerandstonehouse.co.uk') AS home_links,
-  COUNTIF(SAFE_CAST(REGEXP_EXTRACT(price, r'[0-9.]+') AS FLOAT64) = 0) AS zero_price,
-  COUNTIF(SAFE_CAST(REGEXP_EXTRACT(sale_price, r'[0-9.]+') AS FLOAT64) > SAFE_CAST(REGEXP_EXTRACT(price, r'[0-9.]+') AS FLOAT64)) AS sale_above,
-  (SELECT COUNT(*) FROM ${T('bs_core.dim_product_group')}) AS models
-FROM ${T('google_ads_raw.product_feed')}`,
+WITH f AS (
+  SELECT ${T('bs_core.model_key')}(item_group_id) AS mk, NULLIF(TRIM(product_type), '') AS pt,
+         SAFE_CAST(REGEXP_EXTRACT(price, r'[0-9.]+') AS FLOAT64) AS p,
+         SAFE_CAST(REGEXP_EXTRACT(sale_price, r'[0-9.]+') AS FLOAT64) AS sp,
+         RTRIM(link, '/') AS lk
+  FROM ${T('google_ads_raw.product_feed')}
+)
+SELECT COUNT(*) AS feed_rows, COUNT(DISTINCT mk) AS models,
+  (SELECT COUNT(*) FROM (SELECT mk FROM f GROUP BY mk HAVING COUNTIF(pt IS NOT NULL) = 0 AND COUNTIF(p > 0) > 0)) AS no_type_models,
+  COUNTIF(lk = 'https://www.barkerandstonehouse.co.uk' AND p > 0) AS home_links,
+  COUNTIF(p = 0) AS zero_price, COUNTIF(p = 0 AND pt IS NOT NULL) AS zero_price_typed,
+  COUNTIF(sp > p) AS sale_above
+FROM f`,
   feedAge: `SELECT CAST(TIMESTAMP_MILLIS(last_modified_time) AS STRING) AS t FROM ${T('google_ads_raw.__TABLES__')} WHERE table_id = 'product_feed'`,
   shopSummary: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, impressions, clicks, cost, conversions, conv_value, cost_matched, oos_cost FROM ${T('bs_marts.shopping_summary_28d')}`,
   shopModels: `SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, impressions, clicks, cost, conversions, conv_value, roas, oos_clicks, oos_cost, store_units, gap_segment FROM ${T('bs_marts.shopping_by_model_28d')} ORDER BY cost DESC LIMIT 3000`,
@@ -505,7 +511,7 @@ const PLAYBOOK = {
   SHOP_OOS_SPEND: {
     means: 'Shopping clicks are being paid for on variants the feed shows as out of stock.',
     why: 'Shoppers who click an out-of-stock item rarely buy, so the spend is wasted and the click is lost.',
-    steps: ['Check the stock status of the variants named.', 'Take them out of Shopping until they are back, or exclude them in the campaign structure.', 'Ask Feedonomics to make sure availability updates daily.'],
+    steps: ['Check the stock status of the variants named in Merchant Center, because the dashboard\u2019s feed file may differ from what Google sees.', 'Take them out of Shopping until they are back, or exclude them in the campaign structure.', 'Ask Feedonomics to make sure availability updates daily.'],
     done: 'Clicks on out-of-stock items fall to near zero.'},
   SHOP_SCALE: {
     means: 'This product returns much more per pound of Shopping spend than most, but gets less spend than most.',
@@ -515,7 +521,7 @@ const PLAYBOOK = {
   SHOP_STORE_NO_ADS: {
     means: 'A top seller in our showrooms, live on the website, is hardly appearing in Google Shopping.',
     why: 'Customers who would buy it online are not seeing it. The cause is usually a feed approval problem or how campaigns are structured.',
-    steps: ['Search for the product in Merchant Center and check for disapprovals or warnings.', 'Check the feed price is not zero and the sale price is valid.', 'Check it falls inside a campaign or asset group that is serving.', 'If all is well, add it to a campaign with its own budget.'],
+    steps: ['Search for the product in Merchant Center and check for disapprovals or warnings.', 'Check the price and availability Google has for it.', 'Check it falls inside a campaign or asset group that is serving.', 'If all is well, add it to a campaign with its own budget.'],
     done: 'The product shows impressions and clicks within a week.'},
   SEO_CTR: {
     means: 'This page ranks in the top five for a search but gets far fewer clicks than our own pages do at that position.',
@@ -1242,7 +1248,7 @@ function renderShopping(el, d){
       tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Return', num: true, title: 'Revenue per pound of spend', get: r => r.roas.toFixed(1) + 'x'}, {label: 'Spend', num: true, get: r => gbp(r.cost)}, {label: 'Revenue', num: true, get: r => gbp(r.conv_value)}, {label: 'Conversions', num: true, get: r => int(r.conversions)}], scale, {limit: 15, empty: 'No product stands out on return yet.'})) +
     sec('Store bestsellers with no Shopping impressions', 'Top sellers in our showrooms, live on the website, with fewer than 20 Shopping impressions in 28 days. Check Merchant Center approval and campaign coverage.',
       tbl([{label: 'Product', get: r => esc(r.name || r.id) + '<small>' + esc(r.id) + '</small>', cls: 'name'}, {label: 'Sold in store', num: true, get: r => int(r.store_units)}, {label: 'Store sales (ex-VAT)', num: true, get: r => gbp(r.store_revenue)}, {label: 'Shopping impressions', num: true, get: r => int(r.shopping_impressions)}], d.gaps, {limit: 15, empty: 'Every top store seller is showing in Shopping.'})) +
-    '<p class="foot">Returns use Google\u2019s conversion value, so they are higher than GA4 revenue where Google counts view-through or cross-device sales. Spend is for ONLINE Shopping products only.</p>';
+    '<p class="foot">Stock status comes from the feed file used by this dashboard, which may differ from what Google sees. Check a product in Merchant Center before excluding it. Returns use Google\u2019s conversion value, so they are higher than GA4 revenue where Google counts view-through or cross-device sales. Spend is for ONLINE Shopping products only.</p>';
 }
 
 /* ---------- landing pages ---------- */
@@ -1470,13 +1476,13 @@ function renderHealth(el, h){
     '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Store sales matched to a model in the feed</td><td class="num">' + (m == null ? '\u2013' : (100 * m).toFixed(1) + '%') + '</td><td>' + pill(ml) + '</td></tr></tbody></table></div>');
   const f = h.feed;
   if(f){
-    const fl = n => n === 0 ? 'good' : (n / f.feed_rows) < 0.02 ? 'check' : 'fix';
-    html += sec('Is the product feed clean?', int(f.feed_rows) + ' feed rows roll up to ' + int(f.models) + ' models. Fix these in Feedonomics.',
-      '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Rows</th><th class="num">Share</th><th>Status</th><th>Why it matters</th></tr></thead><tbody>' +
-      '<tr><td>No product type</td><td class="num">' + int(f.no_type) + '</td><td class="num">' + (100 * f.no_type / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.no_type)) + '</td><td>These models cannot be compared with similar products by category.</td></tr>' +
-      '<tr><td>Link goes to the homepage</td><td class="num">' + int(f.home_links) + '</td><td class="num">' + (100 * f.home_links / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.home_links)) + '</td><td>Shopping ads for these products land on the homepage, not the product page.</td></tr>' +
-      '<tr><td>Price is \u00A30.00</td><td class="num">' + int(f.zero_price) + '</td><td class="num">' + (100 * f.zero_price / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.zero_price)) + '</td><td>Google Shopping rejects items priced at zero, so these cannot advertise.</td></tr>' +
-      '<tr><td>Sale price above the normal price</td><td class="num">' + int(f.sale_above) + '</td><td class="num">' + (100 * f.sale_above / f.feed_rows).toFixed(1) + '%</td><td>' + pill(fl(f.sale_above)) + '</td><td>Google ignores or rejects these, so the sale does not show.</td></tr></tbody></table></div>');
+    const lv = (n, d) => n === 0 ? 'good' : (n / d) < 0.02 ? 'check' : 'fix';
+    html += sec('Is the product feed clean?', int(f.feed_rows) + ' feed rows roll up to ' + int(f.models) + ' models. Fabric samples (priced at \u00A30.00) are left out of the first two checks, because they do not need a category or a page.',
+      '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Count</th><th class="num">Share</th><th>Status</th><th>Why it matters</th></tr></thead><tbody>' +
+      '<tr><td>Products with no product type</td><td class="num">' + int(f.no_type_models) + ' models</td><td class="num">' + (100 * f.no_type_models / f.models).toFixed(1) + '%</td><td>' + pill(lv(f.no_type_models, f.models)) + '</td><td>These all sit in one Uncategorised group, so comparing them with similar products is weaker.</td></tr>' +
+      '<tr><td>Priced products linking to the homepage</td><td class="num">' + int(f.home_links) + ' rows</td><td class="num">' + (100 * f.home_links / f.feed_rows).toFixed(1) + '%</td><td>' + pill(lv(f.home_links, f.feed_rows)) + '</td><td>The dashboard cannot match these to a product page, so page-level checks skip them.</td></tr>' +
+      '<tr><td>Priced at \u00A30.00</td><td class="num">' + int(f.zero_price) + ' rows</td><td class="num">' + (100 * f.zero_price / f.feed_rows).toFixed(1) + '%</td><td>' + pill('check') + '</td><td>Most are fabric samples and can be ignored. ' + int(f.zero_price_typed) + ' have a product type and look like real products, which are worth a look.</td></tr>' +
+      '<tr><td>Sale price above the normal price</td><td class="num">' + int(f.sale_above) + ' rows</td><td class="num">' + (100 * f.sale_above / f.feed_rows).toFixed(1) + '%</td><td>' + pill('check') + '</td><td>Probably entry errors. The dashboard does not use sale prices yet.</td></tr></tbody></table></div>');
   }
   const ev = Object.fromEntries((h.tracking || []).map(r => [r.event_name, r]));
   const off = r => !r || r.events === 0;
@@ -1533,10 +1539,8 @@ function todoSection(h){
   const sage = state.period ? daysBehind(state.period.end_date) : null; if(sage != null && sage > 8) t.push({who: 'Dan', what: 'Append the last complete week of store sales (' + sage + ' days old).', why: 'Store gap uses these sales to find what sells in store.'});
   if(h.mapped != null && h.mapped < 0.95) t.push({who: 'Dan', what: 'Only ' + (100 * h.mapped).toFixed(1) + '% of store sales match a product. Identify the unmatched codes in Store gap.', why: 'Below 95%, the opportunity list may miss products.'});
   if(h.feed){
-    if(h.feed.no_type) t.push({who: 'Feedonomics', what: 'Add a product type to ' + int(h.feed.no_type) + ' feed rows.', why: 'Products without a category cannot be compared with similar products.'});
-    if(h.feed.zero_price) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.zero_price) + ' feed rows with a price of \u00A30.00 (or exclude them from the Google feed).', why: 'Google Shopping rejects zero-priced items, so those products cannot advertise.'});
-    if(h.feed.sale_above) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.sale_above) + ' feed rows where the sale price is above the normal price.', why: 'Google ignores or rejects these, so the sale price does not show.'});
-    if(h.feed.home_links) t.push({who: 'Feedonomics', what: 'Fix ' + int(h.feed.home_links) + ' feed rows that link to the homepage.', why: 'Shopping ads for these products land on the homepage, not the product page.'});
+    if(h.feed.no_type_models) t.push({who: 'Feedonomics', what: 'Add a product type to ' + int(h.feed.no_type_models) + ' priced products that have none (the list is in the spreadsheet).', why: 'They sit in one Uncategorised group, so their comparisons with similar products are weaker.'});
+    if(h.feed.home_links) t.push({who: 'Feedonomics', what: 'Give ' + int(h.feed.home_links) + ' priced feed rows their own product page link instead of the homepage.', why: 'The dashboard cannot match these to a product page, so page-level checks skip them.'});
   }
   const cw4 = (h.captureWk || []).slice(-4), crec = cw4.length ? cw4.reduce((t, r) => t + r.ga4_orders, 0) / Math.max(1, cw4.reduce((t, r) => t + r.ometria_orders, 0)) : (h.capture ? h.capture.raw_capture : null);
   if(crec != null && crec < 0.9) t.push({who: 'Developer', what: 'GA4 has recorded about ' + (100 * crec).toFixed(0) + '% of online orders over the last four weeks. Check consent mode, ad blockers and the purchase event on the order confirmation page and any payment redirects.', why: 'Every GA4 sales figure is under-counted. The dashboard scales online units to compensate, but conversion and channel figures are not.'});
