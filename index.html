@@ -224,6 +224,13 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 .status #exportBtn{background:var(--ink);color:#fff;border-color:var(--ink)}
 .ver{color:var(--muted);font-size:.8rem;padding:8px 0 40px}
 @media print{.ver{display:none}}
+.pill.aside{color:var(--muted)}
+.asidenote{background:var(--paper);border:1px solid var(--line);border-left:4px solid #b9bcc4;border-radius:0 6px 6px 0;margin:14px 0 18px;padding:10px 16px;font-size:.92rem}
+.asidenote p{margin:4px 0 0;color:var(--muted)}
+.asidenote summary{cursor:pointer}
+.asidenote .lnk{color:var(--slate);text-decoration:underline}
+.asidenote ul{margin:8px 0 0;padding-left:20px}
+.asidenote li{margin-bottom:4px}
 </style>
 </head>
 <body>
@@ -392,6 +399,9 @@ FROM f`,
   shopSummary: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, impressions, clicks, cost, conversions, conv_value, cost_matched, oos_cost FROM ${T('bs_marts.shopping_summary_28d')}`,
   shopModels: `SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, impressions, clicks, cost, conversions, conv_value, roas, oos_clicks, oos_cost, store_units, gap_segment FROM ${T('bs_marts.shopping_by_model_28d')} ORDER BY cost DESC LIMIT 3000`,
   shopGaps: `SELECT product_group_id AS id, product_name AS name, store_units, store_revenue, gap_segment, shopping_impressions FROM ${T('bs_marts.shopping_store_gaps_28d')} ORDER BY store_revenue DESC LIMIT 100`,
+  dimMap: `SELECT product_group_id AS id, category, section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
+  dimMapBasic: `SELECT product_group_id AS id, category, '' AS section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
+  seasonality: `SELECT section, month_of_year, idx, months_covered, peak_ratio, yearly_views FROM ${T('bs_marts.category_seasonality')}`,
   capture: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, ga4_orders, ometria_orders, raw_capture, factor_applied FROM ${T('bs_marts.ga4_capture')}`,
   captureWeekly: `SELECT CAST(wk AS STRING) AS wk, ga4_orders, ometria_orders, capture FROM ${T('bs_marts.ga4_capture_weekly')} ORDER BY wk`,
   mapped: `
@@ -592,6 +602,7 @@ const GLOSSARY = [
   ['Online vs similar', 'How a product\u2019s online share of sales compares with similar products. 100% means the same share; 50% means half.'],
   ['Worth a week', 'Estimated weekly sales at stake if a problem continues or a fix works. Search alerts price clicks at your organic revenue per visit.'],
   ['Confirmed alert', 'An alert that has shown on two days in a row. Urgent alerts show straight away.'],
+  ['Set aside', 'An item the dashboard leaves out of the numbers because it is expected, for example garden furniture out of season. It is always listed with the reason and never hidden.'],
   ['Hidden gem', 'A page that earns at least one and a half times the typical revenue per visit for its type, but gets below-median traffic.'],
   ['Leaky bucket', 'A busy page that earns less than half the typical revenue per visit for its type.'],
   ['Engaged visit', 'A visit that lasts over ten seconds, views two or more pages, or ends in an order.'],
@@ -604,7 +615,7 @@ const state = {
   rows: [], period: null, weekly: null,
   view: 'overview', segment: '1 Not listed online', q: '', cat: '',
   sort: {key: 'opportunity', dir: -1}, limit: 50, loadedAt: null,
-  errors: {}, loading: false, open: new Set(), guideOpen: {}, builtAt: null,
+  errors: {}, loading: false, open: new Set(), guideOpen: {}, builtAt: null, allRows: [], asideRows: [], showAside: {},
   act: {owner: '', confirmedOnly: true}, land: {type: '', channel: ''}, pp: {flagged: true, q: ''}, co: {device: ''}
 };
 const cache = {}, charts = {};
@@ -767,7 +778,8 @@ async function loadAll(){
     else if(keys[i] !== 'built') state.errors[keys[i]] = r.reason;
   });
   if(authFailed){ accessToken = null; state.loading = false; showGate('Your sign-in has expired. Sign in again to reload the figures.'); renderStatus(); return; }
-  if(out.rows) state.rows = out.rows;
+  await loadContext();
+  if(out.rows) setRows(out.rows);
   if(out.period && out.period[0]) state.period = out.period[0];
   if(out.weekly) state.weekly = out.weekly;
   state.builtAt = out.built && out.built[0] ? out.built[0].t : null;
@@ -815,11 +827,211 @@ function loadDemo(){
     oth('TIREDCHR','Tiree Dining Chair, Brown Leather','Dining Chairs','4 Under-indexing online',47,9,608,9831),
     oth('HEWNK006','Cheviot Dining Table 220X98X75Cm, Brown Oak','Dining Tables','4 Under-indexing online',19,1,548,9704)
   ];
+  setRows(state.rows);
   state.period = {start_date:'2026-07-01', end_date:'2026-09-29'};
   state.weekly = null; state.loadedAt = new Date();
 }
 
 /* ---------- shell ---------- */
+/* ---------- context: seasonality and expected items ----------
+   The dashboard should not call out things the team already expects: garden furniture selling less
+   in autumn, or leaving the website for winter. Items matching a rule are "set aside": left out of the
+   headline numbers, alerts, slides and checklist, but always listed with the reason so nothing is hidden.
+   Rules come from context.csv (editable) or the built-in defaults below, plus seasonality learned from
+   GA4 history. */
+const MONTH_NAMES = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const TYPE_LABEL = {'store-only': 'Store-only', discontinued: 'Discontinued', clearance: 'Clearance', expected: 'Expected'};
+const DEFAULT_RULES = [
+  {name: 'Garden and outdoor', type: 'seasonal', match: 'section:garden|garden|outdoor|parasol|patio|sun lounger', months: '3-9',
+   note: 'The web range is reduced in winter, so low sales and missing pages are expected.'},
+  {name: 'Boracay range', type: 'seasonal', match: 'boracay', months: '3-9',
+   note: 'Boracay appears to be part of the garden range. Confirm this and edit the row in context.csv.'}
+];
+const CTX = {rules: [], source: 'built-in', dim: new Map(), pathDim: new Map(), season: new Map(), dimErr: null, seasonErr: null, seasonMonths: 0};
+
+function parseMonths(t){
+  const out = new Set();
+  String(t || '').split(',').forEach(part => {
+    const m = part.trim().match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
+    if(m){ let a = +m[1], b = +m[2]; for(let i = 0; i < 12; i++){ out.add(a); if(a === b) break; a = a === 12 ? 1 : a + 1; } }
+    else if(/^\d{1,2}$/.test(part.trim())) out.add(+part.trim());
+  });
+  return [...out].filter(x => x >= 1 && x <= 12).sort((a, b) => a - b);
+}
+function prepRule(r){
+  return {name: r.name, type: String(r.type || 'expected').trim().toLowerCase(), note: r.note || '', months: parseMonths(r.months),
+    tokens: String(r.match || '').split('|').map(x => x.trim().toLowerCase()).filter(Boolean)};
+}
+function parseCsvText(text){
+  const rows = []; let row = [], cur = '', q = false;
+  for(let i = 0; i < text.length; i++){
+    const c = text[i];
+    if(q){ if(c === '"'){ if(text[i + 1] === '"'){ cur += '"'; i++; } else q = false; } else cur += c; }
+    else if(c === '"') q = true;
+    else if(c === ','){ row.push(cur); cur = ''; }
+    else if(c === '\n' || c === '\r'){ if(c === '\r' && text[i + 1] === '\n') i++; row.push(cur); cur = ''; if(row.some(x => x.trim() !== '')) rows.push(row); row = []; }
+    else cur += c;
+  }
+  row.push(cur); if(row.some(x => x.trim() !== '')) rows.push(row);
+  return rows;
+}
+function parseRulesCsv(text){
+  const rows = parseCsvText(text.replace(/^\uFEFF/, '')); if(rows.length < 2) return [];
+  const head = rows[0].map(h => h.trim().toLowerCase());
+  const at = n => head.indexOf(n);
+  return rows.slice(1).map(r => prepRule({name: r[at('name')], type: r[at('type')], match: r[at('match')], months: r[at('months')], note: r[at('note')]})).filter(r => r.name && r.tokens.length);
+}
+async function loadContext(){
+  let rules = null;
+  try {
+    const r = await fetch('context.csv', {cache: 'no-store'});
+    if(r.ok){ const parsed = parseRulesCsv(await r.text()); if(parsed.length){ rules = parsed; CTX.source = 'context.csv'; } }
+  } catch(e) { /* falls back to the built-in rules */ }
+  if(!rules){ rules = DEFAULT_RULES.map(prepRule); CTX.source = 'built-in'; }
+  CTX.rules = rules;
+  try {
+    let rows;
+    try { rows = await bq(SQL.dimMap); } catch(e) { rows = await bq(SQL.dimMapBasic); }
+    CTX.dim = new Map(rows.map(r => [r.id, r])); CTX.pathDim = new Map(rows.filter(r => r.url).map(r => [r.url, r])); CTX.dimErr = null;
+  } catch(e) { CTX.dimErr = e && e.message ? e.message : String(e); }
+  try {
+    const rows = await bq(SQL.seasonality), by = new Map();
+    rows.forEach(r => { const o = by.get(r.section) || {section: r.section, idx: Array(13).fill(null), months: r.months_covered, peak: r.peak_ratio, views: r.yearly_views}; o.idx[r.month_of_year] = r.idx; by.set(r.section, o); });
+    CTX.season = new Map([...by.entries()].filter(([, o]) => o.months >= 12 && o.peak >= 3 && o.views >= 5000));
+    CTX.seasonMonths = rows.reduce((m, r) => Math.max(m, r.months_covered || 0), 0); CTX.seasonErr = null;
+  } catch(e) { CTX.seasonErr = e && e.message ? e.message : String(e); CTX.season = new Map(); }
+}
+function monthRange(ms){
+  if(!ms.length) return '';
+  const s = [...ms].sort((a, b) => a - b); let start = s[0];
+  for(const m of s){ if(!s.includes(m === 1 ? 12 : m - 1)){ start = m; break; } }
+  const run = []; let m = start; while(s.includes(m) && run.length < 12){ run.push(m); m = m === 12 ? 1 : m + 1; }
+  return run.length === s.length ? MONTH_NAMES[run[0] - 1] + ' to ' + MONTH_NAMES[run[run.length - 1] - 1] : s.map(x => MONTH_NAMES[x - 1]).join(', ');
+}
+function nextInSeason(ms){
+  const now = new Date().getMonth() + 1;
+  for(let k = 1; k <= 12; k++){ const m = ((now - 1 + k) % 12) + 1; if(ms.includes(m)) return MONTH_NAMES[m - 1]; }
+  return '';
+}
+/* does an item (a product, page or term) fall under a rule? it = {id, name, category, path} */
+function ctxMatch(it){
+  const name = (it.name || '').toLowerCase(), cat = (it.category || '').toLowerCase(), path = (it.path || '').toLowerCase(), id = (it.id || '').toUpperCase();
+  const d = (it.id && CTX.dim.get(it.id)) || (path && CTX.pathDim.get(path)) || null;
+  const sec = ((d && d.section) || '').toLowerCase(), dcat = ((d && d.category) || '').toLowerCase();
+  for(const r of CTX.rules){
+    for(const t of r.tokens){
+      let hit = false;
+      if(t.startsWith('section:')) hit = sec === t.slice(8);
+      else if(t.startsWith('code:')) hit = id.startsWith(t.slice(5).toUpperCase());
+      else if(t.startsWith('path:')) hit = path.startsWith(t.slice(5));
+      else if(d) hit = sec.includes(t) || dcat.includes(t);          // known product: judge by its category, not its name
+      else hit = name.includes(t) || cat.includes(t) || path.includes(t);
+      if(hit) return r;
+    }
+  }
+  if(d && d.section){
+    const s = CTX.season.get(d.section);
+    if(s) return {name: d.section + ' (seasonal, learned)', type: 'seasonal', learned: true, section: d.section, idx: s.idx, tokens: [], months: [], note: ''};
+  }
+  return null;
+}
+function ctxState(rule){
+  if(rule.type === 'seasonal'){
+    const m = new Date().getMonth() + 1;
+    if(rule.learned){
+      const idx = rule.idx[m], out = idx != null && idx < 0.6;
+      return {expected: out, text: out ? 'Out of season: demand for ' + rule.section + ' is about ' + Math.round(100 * idx) + '% of its yearly average in ' + MONTH_NAMES[m - 1] + ', judging by previous years.' : ''};
+    }
+    const out = rule.months.length > 0 && !rule.months.includes(m);
+    return {expected: out, text: out ? 'Out of season: ' + rule.name + ' sells ' + monthRange(rule.months) + '. ' + (rule.note ? rule.note + ' ' : '') + 'Back in ' + nextInSeason(rule.months) + '.' : ''};
+  }
+  return {expected: true, text: (TYPE_LABEL[rule.type] || 'Expected') + ': ' + (rule.note || rule.name)};
+}
+function ctxFor(it){ const r = ctxMatch(it); if(!r) return null; const st = ctxState(r); return st.expected ? {rule: r.name, text: st.text, type: r.type} : null; }
+function ctxSplit(list, itemFn){
+  const keep = [], aside = [];
+  (list || []).forEach(r => { const c = ctxFor(itemFn(r)); r.ctx = c; (c ? aside : keep).push(r); });
+  return {keep, aside};
+}
+const asideTag = r => r && r.ctx ? ' <span class="pill aside" title="' + esc(r.ctx.text) + '">\u21B7 Set aside: ' + esc(r.ctx.rule) + '</span>' : '';
+function asideNote(items, labelFn, what){
+  if(!items || !items.length) return '';
+  return '<details class="asidenote"><summary><b>' + items.length + ' ' + plural(items.length, 'item is', 'items are') + ' set aside</b> as seasonal or expected' + (what ? ' (' + esc(what) + ')' : '') + '. <span class="lnk">Show what and why</span></summary><ul>' +
+    items.slice(0, 15).map(r => '<li><b>' + esc(labelFn(r)) + '</b> \u2013 ' + esc(r.ctx.text) + '</li>').join('') + (items.length > 15 ? '<li>and ' + (items.length - 15) + ' more.</li>' : '') + '</ul></details>';
+}
+/* the same filtering for each kind of data, shared by the tabs, the slides and the checklist */
+function ctxSeoData(d){
+  const aside = [], f = (rows, area) => { const x = ctxSplit(rows, r => ({path: r.page, name: r.page + ' ' + (r.query || '')})); x.aside.forEach(r => { r.ctxArea = area; aside.push(r); }); return x.keep; };
+  return {...d, ctr: f(d.ctr, 'Title rewrite'), near: f(d.near, 'Close to page one'), drops: f(d.drops, 'Losing clicks'), aside};
+}
+function ctxSearchData(d){
+  const x = ctxSplit(d.rows, r => ({name: r.term + ' ' + (r.store_product || '')}));
+  return {...d, rows: x.keep, aside: x.aside};
+}
+function ctxProductsData(d){
+  const x = ctxSplit(d.rows, r => ({id: r.id, name: r.name, category: r.category, path: r.url}));
+  return {...d, rows: x.keep, allRows: d.rows, aside: x.aside.filter(r => r.merch_review)};
+}
+function ctxShopData(d){
+  const x = ctxSplit(d.models, r => ({id: r.id, name: r.name, category: r.category, path: r.url}));
+  const g = ctxSplit(d.gaps, r => ({id: r.id, name: r.name}));
+  return {...d, models: x.keep, asideModels: x.aside, gaps: g.keep, asideGaps: g.aside};
+}
+function setRows(rows){
+  state.allRows = rows;
+  const x = ctxSplit(rows, r => ({id: r.id, name: r.name, category: r.category, path: r.url}));
+  state.rows = x.keep; state.asideRows = x.aside;
+}
+function asideSummary(){
+  const a = state.asideRows || []; if(!a.length) return null;
+  const sum = a.reduce((t, r) => t + (r.opportunity || 0), 0), names = [...new Set(a.map(r => r.ctx.rule))];
+  return {n: a.length, sum, names};
+}
+/* everything set aside right now, for the checklist and the Guide */
+function collectAside(data){
+  const out = [];
+  (state.asideRows || []).forEach(r => out.push({area: 'Store gap', item: r.name, why: r.ctx.text, value: gbp(r.opportunity) + ' est. missed sales'}));
+  if(data.actions) actionRowsAll(data.actions).filter(r => r.aside).forEach(r => out.push({area: 'Alert: ' + (RULES[r.rule_code] || r.rule_code), item: r.entity_name, why: r.ctx.text, value: r.gbp != null ? gbp(r.gbp) + ' a week' : ''}));
+  if(data.seo) ctxSeoData(data.seo).aside.forEach(r => out.push({area: 'Organic search: ' + r.ctxArea, item: r.page, why: r.ctx.text, value: ''}));
+  if(data.search) ctxSearchData(data.search).aside.forEach(r => out.push({area: 'Site search', item: r.term, why: r.ctx.text, value: int(r.searches) + ' searches'}));
+  if(data.products) ctxProductsData(data.products).aside.forEach(r => out.push({area: 'Product pages', item: r.name, why: r.ctx.text, value: r.est_gbp_week ? gbp(r.est_gbp_week) + ' a week' : ''}));
+  return out;
+}
+
+function asideBarOpps(){
+  const a = asideSummary(); if(!a) return '';
+  return '<div class="asidenote"><label class="check"><input type="checkbox" id="showaside"' + (state.showAside.opps ? ' checked' : '') + '> Show ' + a.n + ' set-aside ' + plural(a.n, 'product', 'products') + ' (' + gbpK(a.sum) + ')</label>' +
+    '<p>Left out of the numbers on this page because they are seasonal or expected: ' + esc(a.names.join(', ')) + '. They are not hidden, only counted separately.</p></div>';
+}
+function asideOverviewNote(a){
+  return '<div class="asidenote"><b>' + a.n + ' ' + plural(a.n, 'product', 'products') + ' worth ' + gbpK(a.sum) + ' ' + plural(a.n, 'is', 'are') + ' set aside</b> because ' + plural(a.n, 'it is', 'they are') + ' seasonal or expected (' + esc(a.names.join(', ')) + '). ' + plural(a.n, 'It is', 'They are') + ' not in the numbers on this page. <button type="button" class="linkish" data-aside-go>See what and why</button></div>';
+}
+function asideFoot(){
+  const a = asideSummary(); if(!a) return '';
+  return 'Set aside as seasonal or expected: ' + a.n + ' ' + plural(a.n, 'product', 'products') + ' worth ' + gbpK(a.sum) + ' (' + a.names.join(', ') + ').';
+}
+function contextGuide(){
+  const rows = CTX.rules.map(r => [r.name, r.type === 'seasonal' ? 'Seasonal' : (TYPE_LABEL[r.type] || r.type), r.type === 'seasonal' ? monthRange(r.months) : 'All year', r.note]);
+  const learned = [...CTX.season.values()].map(o => {
+    const peak = Math.max(...o.idx.filter(x => x != null)), months = o.idx.map((x, i) => x != null && x >= 0.8 * peak ? i : 0).filter(Boolean);
+    return [o.section, 'Seasonal (learned from GA4)', monthRange(months), 'The busiest month is ' + o.peak.toFixed(1) + ' times the quietest.'];
+  });
+  const a = asideSummary();
+  return sec('Seasonality and expected items', 'The dashboard does not call out things the team already expects, such as garden furniture selling less in autumn or leaving the website for winter. Matching items are set aside: left out of the headline numbers, alerts, slides and checklist, and always listed with the reason. ' +
+    (a ? 'Right now ' + a.n + ' ' + plural(a.n, 'product', 'products') + ' worth ' + gbpK(a.sum) + ' ' + plural(a.n, 'is', 'are') + ' set aside on Store gap. ' : '') + 'Rules come from ' + esc(CTX.source) + '. To change them, edit context.csv in the dashboard folder and push it.',
+    tbl([{label: 'Rule', get: r => '<b>' + esc(r[0]) + '</b>', cls: 'nowrap'}, {label: 'Type', get: r => esc(r[1])}, {label: 'In season', get: r => esc(r[2])}, {label: 'Why', get: r => esc(r[3]), cls: 'name'}], rows.concat(learned), {limit: 30}));
+}
+function contextHealth(){
+  const learnedOk = !CTX.seasonErr && CTX.seasonMonths >= 12;
+  const rows = [
+    ['Context rules loaded', CTX.rules.length + ' from ' + CTX.source, 'good', 'Edit context.csv to add or change rules.'],
+    ['Product ranges known to the rules', CTX.dimErr ? 'Not loaded' : int(CTX.dim.size) + ' models', CTX.dimErr ? 'check' : 'good', CTX.dimErr ? 'Re-run the main build so garden products are recognised by their category, not only their name.' : 'Products are matched by category where known.'],
+    ['GA4 history for learning seasonality', CTX.seasonErr ? 'Not built yet' : CTX.seasonMonths + ' months', learnedOk ? 'good' : 'check', learnedOk ? CTX.season.size + ' seasonal ' + plural(CTX.season.size, 'range was', 'ranges were') + ' found automatically.' : 'Needs 12 or more months of GA4 history. Until then only the rules above apply.']
+  ];
+  return sec('Does the dashboard know about seasonality?', 'So that expected quiet spells and seasonal ranges are not called out as problems.',
+    tbl([{label: 'Check', get: r => esc(r[0])}, {label: 'Result', get: r => esc(r[1])}, {label: 'Status', get: r => pill(r[2])}, {label: 'Note', get: r => esc(r[3]), cls: 'name'}], rows, {limit: 5}));
+}
+
 const GROUPS = [['Start', ['overview', 'actions']], ['Products', ['opps', 'products', 'lists', 'search']], ['Traffic', ['seo', 'landing', 'shopping']], ['Customers', ['checkout', 'journeys']], ['System', ['health', 'guide']]];
 const TAB_ORDER = GROUPS.flatMap(g => g[1]);
 const TABS = {
@@ -966,6 +1178,7 @@ function renderOverview(){
     html += '<h1>Every product with meaningful store sales is on the website.</h1><p>Nothing to list this week. The other opportunities are below.</p>';
   }
   html += '</div>';
+  const asideInfo = asideSummary(); if(asideInfo) html += asideOverviewNote(asideInfo);
   const pr = priorities();
   if(pr.length){
     html += '<div class="hsec"><h2>This week\u2019s priorities</h2><p class="sub">In the order we would tackle them. Values are estimates.</p><ol class="prio">' + pr.map((p, i) =>
@@ -988,6 +1201,7 @@ function renderOverview(){
     '<div class="panel"><h2>Store and online sales by week</h2><p class="sub">Valid orders in Ometria, complete weeks only.</p>' + chartBox('weekly', 'Stacked bars of weekly store and online order value') + '<p class="stat" id="weeklystat"></p></div></div>';
   el.innerHTML = html;
   decorate(el, 'overview');
+  const ag = el.querySelector('[data-aside-go]'); if(ag) ag.addEventListener('click', () => { state.showAside.opps = true; state.segment = 'ALL'; state.limit = 50; showView('opps'); window.scrollTo({top: 0}); });
   el.querySelectorAll('[data-goto]').forEach(b => b.addEventListener('click', () => { state.segment = b.dataset.goto; state.limit = 50; showView('opps'); window.scrollTo({top: 0}); }));
   el.querySelectorAll('[data-pri]').forEach(b => b.addEventListener('click', () => {
     const p = pr[+b.dataset.pri]; if(p.seg){ state.segment = p.seg; state.limit = 50; showView('opps'); } else showView(p.tab); window.scrollTo({top: 0});
@@ -1079,7 +1293,7 @@ function renderOpps(){
   el.innerHTML = '<div class="lede"><h1>' + nGap + ' ' + plural(nGap, 'product is', 'products are') + ' selling less online than ' + plural(nGap, 'it should', 'they should') + '.</h1>' +
     '<p>Worth about ' + gbpK(sGap) + ' ex-VAT over ' + esc(per.months) + ' if they sold online like similar products. Choose a group to see what is holding them back and what to do.</p></div>' +
     '<div class="chips" role="group" aria-label="Opportunity type">' + chips + '</div>' + card +
-    '<div class="tools"><label class="sr" for="q">Search products</label><input id="q" type="search" placeholder="Search by name or code" value="' + esc(state.q) + '">' +
+    asideBarOpps() + '<div class="tools"><label class="sr" for="q">Search products</label><input id="q" type="search" placeholder="Search by name or code" value="' + esc(state.q) + '">' +
     '<label class="sr" for="cat">Category</label><select id="cat"><option value="">All categories</option>' + cats.map(c => '<option' + (state.cat === c ? ' selected' : '') + '>' + esc(c) + '</option>').join('') + '</select>' +
     '<button type="button" class="btn quiet" id="csv">Download CSV with explanations</button></div><div id="tablehost"></div>' +
     '<p class="foot">Est. missed sales = store units \u00D7 how much of a similar product\u2019s sales happen online, minus what the product sells online now, priced at its store average (ex-VAT). It ranks products and is not a forecast. Similar products means the same category on the website.</p>';
@@ -1088,11 +1302,12 @@ function renderOpps(){
   $('#q').addEventListener('input', e => { state.q = e.target.value; state.limit = 50; renderTable(); });
   $('#cat').addEventListener('change', e => { state.cat = e.target.value; state.limit = 50; renderTable(); });
   $('#csv').addEventListener('click', downloadCsv);
+  const sa = $('#showaside'); if(sa) sa.addEventListener('change', e => { state.showAside.opps = e.target.checked; state.limit = 50; renderOpps(); });
   renderTable();
 }
 function filteredRows(){
   const q = state.q.trim().toLowerCase();
-  let rows = state.rows.filter(r => state.segment === 'ALL' || r.segment === state.segment);
+  let rows = (state.showAside.opps ? state.allRows : state.rows).filter(r => state.segment === 'ALL' || r.segment === state.segment);
   if(q) rows = rows.filter(r => (r.name || '').toLowerCase().includes(q) || (r.id || '').toLowerCase().includes(q));
   if(state.cat) rows = rows.filter(r => r.category === state.cat);
   const {key, dir} = state.sort;
@@ -1109,7 +1324,7 @@ function renderTable(){
   if(!rows.length){ host.innerHTML = '<div class="tablewrap"><p class="empty">No products match. Clear the search or choose another category.</p></div>'; return; }
   const cell = (r, c) => {
     switch(c.key){
-      case 'name': return (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>' + (r.segment !== 'OK' ? whyButton('p:' + r.id, state.open.has('p:' + r.id) ? 'Hide explanation' : 'Why is this here?') : '');
+      case 'name': return (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>' + asideTag(r) + (r.segment !== 'OK' ? whyButton('p:' + r.id, state.open.has('p:' + r.id) ? 'Hide explanation' : 'Why is this here?') : '');
       case 'category': return esc(r.category);
       case 'store_revenue': return gbp(r.store_revenue);
       case 'share_index': return r.share_index == null ? '\u2013' : int(r.share_index) + '%';
@@ -1121,7 +1336,7 @@ function renderTable(){
   const shown = rows.slice(0, state.limit);
   const body = shown.map(r => {
     let h = '<tr>' + cols.map(c => '<td class="' + (c.cls || '') + (c.key === 'opportunity' ? ' money' : '') + '">' + cell(r, c) + '</td>').join('') + '</tr>';
-    if(state.open.has('p:' + r.id)){ const x = explainRow(r); h += '<tr class="detail"><td colspan="' + cols.length + '"><div class="why"><p><b>Why it is here.</b> ' + esc(x.why) + '</p>' + (x.next ? '<p><b>What to do next.</b> ' + esc(x.next) + '</p>' : '') + '</div></td></tr>'; }
+    if(state.open.has('p:' + r.id)){ const x = explainRow(r); h += '<tr class="detail"><td colspan="' + cols.length + '"><div class="why">' + (r.ctx ? '<p><b>Why it is set aside.</b> ' + esc(r.ctx.text) + '</p>' : '') + '<p><b>Why it is here.</b> ' + esc(x.why) + '</p>' + (x.next ? '<p><b>What to do next.</b> ' + esc(x.next) + '</p>' : '') + '</div></td></tr>'; }
     return h;
   }).join('');
   host.innerHTML = '<div class="tablewrap"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>' +
@@ -1137,9 +1352,9 @@ function renderTable(){
 }
 function downloadCsv(){
   const rows = filteredRows();
-  const cols = ['id', 'name', 'category', 'group', 'store_units', 'store_revenue', 'web_units', 'visits', 'share_index', 'est_missed_sales_ex_vat', 'why_it_is_here', 'what_to_do_next'];
+  const cols = ['id', 'name', 'category', 'group', 'store_units', 'store_revenue', 'web_units', 'visits', 'share_index', 'est_missed_sales_ex_vat', 'why_it_is_here', 'what_to_do_next', 'set_aside_reason'];
   const q = v => v == null ? '' : '"' + String(v).replace(/"/g, '""') + '"';
-  const line = r => { const x = explainRow(r); return [r.id, r.name, r.category, SEG[r.segment] ? SEG[r.segment].label : r.segment, r.store_units, r.store_revenue, r.web_units, r.visits, r.share_index, r.opportunity, x.why, x.next].map(q).join(','); };
+  const line = r => { const x = explainRow(r); return [r.id, r.name, r.category, SEG[r.segment] ? SEG[r.segment].label : r.segment, r.store_units, r.store_revenue, r.web_units, r.visits, r.share_index, r.opportunity, x.why, x.next, r.ctx ? r.ctx.text : ''].map(q).join(','); };
   const csv = [cols.join(',')].concat(rows.map(line)).join('\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob(['\uFEFF' + csv], {type: 'text/csv'}));
@@ -1154,10 +1369,16 @@ async function loadActions(){
   if(rs[0].status === 'rejected') throw rs[0].reason;
   return {alerts: val(rs[0]) || [], seo: val(rs[1]) || [], seoErr: rs[1].status === 'rejected' ? rs[1].reason : null, rps: val(rs[2]) && val(rs[2])[0] ? val(rs[2])[0].rps : null};
 }
-function actionRows(d){
-  return d.alerts.concat(d.seo).map(r => ({...r, gbp: r.est_gbp_week != null ? r.est_gbp_week : (r.est_clicks_week != null && d.rps ? r.est_clicks_week * d.rps : null),
-    confirmed: r.run_count >= 2 || r.priority === 'P1'}));
+function actionRowsAll(d){
+  return d.alerts.concat(d.seo).map(r => {
+    const o = {...r, gbp: r.est_gbp_week != null ? r.est_gbp_week : (r.est_clicks_week != null && d.rps ? r.est_clicks_week * d.rps : null), confirmed: r.run_count >= 2 || r.priority === 'P1'};
+    const isPath = String(r.entity_name).startsWith('/');
+    const c = ctxFor({id: isPath ? '' : r.entity_id, name: r.entity_name, path: isPath ? r.entity_name : ''});
+    if(c){ o.aside = true; o.ctx = c; }
+    return o;
+  });
 }
+function actionRows(d){ return actionRowsAll(d).filter(r => !r.aside); }
 function renderActions(el, d){
   const rows = actionRows(d);
   const owners = [...new Set(rows.map(r => r.owner_pillar))].sort();
@@ -1180,6 +1401,7 @@ function renderActions(el, d){
     '<label class="check"><input type="checkbox" id="conf"' + (state.act.confirmedOnly ? ' checked' : '') + '> Confirmed alerts only</label>' +
     '<button type="button" class="btn quiet" id="acsv">Download CSV</button></div>' +
     (d.seoErr ? '<div class="banner"><strong>Search alerts are missing.</strong> Run 02_build_eu_search-console.sql once to add them. BigQuery said: ' + esc(d.seoErr.message) + '</div>' : '') +
+    asideNote(actionRowsAll(d).filter(r => r.aside), r => (RULES[r.rule_code] || r.rule_code) + ': ' + r.entity_name, 'alerts') +
     tbl(cols, list, {limit: 100, rowKey: key, detail, empty: rows.length ? 'No alerts match. Untick "Confirmed alerts only" to see alerts seen once.' : 'No alerts yet. They appear after the nightly checks have run, and are confirmed once seen on two days in a row.'}) +
     '<p class="foot">Search alerts show clicks priced at your organic revenue per visit' + (d.rps ? ' (\u00A3' + d.rps.toFixed(2) + ')' : '') + '. Product alerts use your own baskets and prices.</p>';
   decorate(el, 'actions');
@@ -1200,7 +1422,8 @@ async function loadSeo(){
   for(let i = 0; i < 4; i++) if(rs[i].status === 'rejected') throw rs[i].reason;
   return {ctr: rs[0].value, near: rs[1].value, drops: rs[2].value, daily: rs[3].value, rps: val(rs[4]) && val(rs[4])[0] ? val(rs[4])[0].rps : null};
 }
-function renderSeo(el, d){
+function renderSeo(el, d0){
+  const d = ctxSeoData(d0);
   const gain = d.ctr.reduce((t, r) => t + r.ctr_gap_clicks, 0), pages = new Set(d.ctr.map(r => r.page)).size;
   const worth = d.rps ? ' That is about ' + gbpK(gain * d.rps) + ' a month at your organic revenue per visit.' : '';
   const weeks = [...new Set(d.daily.map(r => mondayOf(r.d)))].sort().slice(0, -1).slice(-12);
@@ -1208,6 +1431,7 @@ function renderSeo(el, d){
   const nb = seg('Non-brand'), nbRecent = nb.slice(-4).reduce((a, b) => a + b, 0), nbPrev = nb.slice(-8, -4).reduce((a, b) => a + b, 0);
   el.innerHTML = lede(pages ? 'Rewriting titles on ' + pages + ' ' + plural(pages, 'page', 'pages') + ' could win about ' + int(gain) + ' more clicks a month.' : 'No title and description rewrites stand out this month.',
       'These pages rank in the top five but get fewer clicks than your own pages do at the same position.' + worth) +
+    asideNote(d.aside, r => r.page + ' (' + r.ctxArea + ')', 'pages') +
     sec('Clicks by week', 'Complete weeks. Brand searches are separated so TV bursts do not hide changes in everyday searching.' + (nbPrev ? (Math.abs(nbRecent - nbPrev) / nbPrev < 0.005 ? ' Non-brand clicks are level with the four weeks before.' : ' Non-brand clicks are ' + (nbRecent >= nbPrev ? 'up ' : 'down ') + Math.abs(Math.round(100 * (nbRecent - nbPrev) / nbPrev)) + '% on the four weeks before.') : ''), '<div class="panel">' + chartBox('seochart', 'Stacked bars of weekly search clicks by brand, non-brand and anonymised queries') + '</div>') +
     sec('Rewrite the title and description', 'Top-five positions where click-through is under 60% of what your own pages get at that position. Check the live results page first: a new AI Overview or Shopping box can explain a fall.',
       tbl([{label: 'Page', get: r => pageLink(r.page), cls: 'name'}, {label: 'Query', get: r => esc(r.query)}, {label: 'Position', num: true, get: r => r.avg_position.toFixed(1)}, {label: 'Impressions', num: true, get: r => int(r.impressions)},
@@ -1229,8 +1453,9 @@ async function loadShopping(){
   const rs = await Promise.all([bq(SQL.shopSummary), bq(SQL.shopModels), bq(SQL.shopGaps)]);
   return {sum: rs[0][0] || null, models: rs[1], gaps: rs[2]};
 }
-function renderShopping(el, d){
-  const sm = d.sum, rows = d.models;
+function renderShopping(el, d0){
+  const d = ctxShopData(d0), sm = d.sum, rows = d.models;
+  const outSeason = d.asideModels.filter(r => r.cost >= 100).sort((a, b) => b.cost - a.cost);
   const link = r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name || r.id) + '</a>' : esc(r.name || r.id)) + '<small>' + esc(r.id) + '</small>';
   const wasted = rows.filter(r => r.cost >= 100 && r.conv_value === 0).sort((a, b) => b.cost - a.cost);
   const oos = rows.filter(r => r.oos_cost >= 30).sort((a, b) => b.oos_cost - a.oos_cost);
@@ -1242,6 +1467,8 @@ function renderShopping(el, d){
       sm ? int(sm.clicks) + ' clicks and ' + int(sm.conversions) + ' conversions from ' + dmy(sm.ws) + ' to ' + dmy(sm.we) + '. These are Google\u2019s own conversions, so they will not match GA4 or Ometria exactly.' : '') +
     sec('Spend with no sales', gbpK(sum(wasted.map(r => r.cost))) + ' across ' + wasted.length + ' ' + plural(wasted.length, 'product', 'products') + ' that took at least \u00A3100 and sold nothing. Check the price, stock and page first, then exclude or cut the bid.',
       tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend', num: true, get: r => '<span class="money">' + gbp(r.cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.clicks)}, {label: 'Impressions', num: true, get: r => int(r.impressions)}, {label: 'Sold in store', num: true, title: 'Units over the store sales period', get: r => r.store_units == null ? '\u2013' : int(r.store_units)}], wasted, {limit: 15, empty: 'No product has taken \u00A3100 without a sale.'})) +
+    (outSeason.length ? sec('Out-of-season products still spending', gbpK(outSeason.reduce((t, r) => t + r.cost, 0)) + ' on ' + outSeason.length + ' out-of-season ' + plural(outSeason.length, 'product', 'products') + '. Low sales are expected, so these are not faults. The question is whether the ads should be paused or cut until the season returns.',
+      tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend', num: true, get: r => '<span class="money">' + gbp(r.cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.clicks)}, {label: 'Sales', num: true, get: r => gbp(r.conv_value)}, {label: 'Why it is expected', get: r => esc(r.ctx.text), cls: 'wide'}], outSeason, {limit: 10})) : '') +
     sec('Spend on out-of-stock items', gbpK(sum(oos.map(r => r.oos_cost))) + ' of clicks on items the feed shows as out of stock. Take them out of Shopping until they are back.',
       tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend on out-of-stock', num: true, get: r => '<span class="money">' + gbp(r.oos_cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.oos_clicks)}, {label: 'Total spend', num: true, get: r => gbp(r.cost)}], oos, {limit: 15, empty: 'Almost no spend goes to out-of-stock items.'})) +
     sec('Worth scaling', 'Products that return at least one and a half times the typical return on a below-typical spend' + (medRoas ? ' (typical return ' + medRoas.toFixed(1) + 'x). Raise their bid or give them their own budget.' : '.'),
@@ -1260,7 +1487,7 @@ function renderLanding(el, d){
   const agg = (rows) => { const m = new Map(); rows.forEach(r => { const o = m.get(r.landing_path) || {path: r.landing_path, type: r.page_type, sessions: 0, engaged: 0, carts: 0, orders: 0, revenue: 0}; o.sessions += r.sessions; o.engaged += r.engaged_sessions; o.carts += r.cart_sessions; o.orders += r.purchase_sessions; o.revenue += r.revenue; m.set(r.landing_path, o); }); return [...m.values()]; };
   const all = agg(d.pages);
   const meds = {}; [...new Set(all.map(p => p.type))].forEach(t => { const ps = all.filter(p => p.type === t && p.sessions >= 100); meds[t] = {rps: median(ps.map(p => p.revenue / p.sessions)), sessions: median(ps.map(p => p.sessions))}; });
-  const flagOf = p => { const m = meds[p.type]; if(!m || m.rps == null || p.sessions < 300) return ''; const rps = p.revenue / p.sessions;
+  const flagOf = p => { if(ctxFor({path: p.path, name: p.path})) return 'Out of season'; const m = meds[p.type]; if(!m || m.rps == null || p.sessions < 300) return ''; const rps = p.revenue / p.sessions;
     if(rps >= 1.5 * m.rps && p.sessions < m.sessions) return 'Hidden gem'; if(p.sessions >= m.sessions && rps < 0.5 * m.rps) return 'Leaky bucket'; return ''; };
   const chans = [...new Set(d.pages.map(r => r.channel_group))].sort(), types = [...new Set(all.map(p => p.type))].sort();
   const rows = agg(d.pages.filter(r => !state.land.channel || r.channel_group === state.land.channel)).filter(p => !state.land.type || p.type === state.land.type).sort((a, b) => b.sessions - a.sessions);
@@ -1275,7 +1502,7 @@ function renderLanding(el, d){
       '<label class="sr" for="lc">Channel</label><select id="lc"><option value="">All channels</option>' + chans.map(t => '<option' + (state.land.channel === t ? ' selected' : '') + '>' + esc(t) + '</option>').join('') + '</select></div>' +
       tbl([{label: 'Page', get: r => pageLink(r.path), cls: 'name'}, {label: 'Type', get: r => esc(r.type)}, {label: 'Visits', num: true, get: r => int(r.sessions)}, {label: 'Engaged', num: true, title: 'Visits of over ten seconds, with two or more page views, or ending in an order', get: r => pct(r.engaged / r.sessions, 0)},
            {label: 'Add to basket', num: true, title: 'Share of visits that added the product to their basket', get: r => pct(r.carts / r.sessions)}, {label: 'Orders', num: true, get: r => int(r.orders)}, {label: 'Per visit', num: true, title: 'Revenue divided by visits', get: r => '\u00A3' + (r.revenue / r.sessions).toFixed(2)},
-           {label: 'Flag', get: r => { const f = flagOf(r); return f ? '<span class="pill ' + (f === 'Hidden gem' ? 'good' : 'fix') + '">' + (f === 'Hidden gem' ? '\u2713 ' : '\u2715 ') + f + '</span>' : ''; }}], rows, {limit: 40})) +
+           {label: 'Flag', get: r => { const f = flagOf(r); return f ? '<span class="pill ' + (f === 'Out of season' ? 'aside' : f === 'Hidden gem' ? 'good' : 'fix') + '">' + (f === 'Out of season' ? '\u21B7 ' : f === 'Hidden gem' ? '\u2713 ' : '\u2715 ') + f + '</span>' : ''; }}], rows, {limit: 40})) +
     '<p class="foot">Engaged means a visit of over ten seconds, two or more page views, or an order. Pages with fewer than ten visits from a channel are left out.</p>';
   $('#lt', el).addEventListener('change', e => { state.land.type = e.target.value; renderLanding(el, d); });
   $('#lc', el).addEventListener('change', e => { state.land.channel = e.target.value; renderLanding(el, d); });
@@ -1286,7 +1513,8 @@ async function loadSearch(){
   const rs = await Promise.all([bq(SQL.searchTerms), bq(SQL.searchSummary)]);
   return {rows: rs[0], sum: rs[1][0] || null};
 }
-function renderSearch(el, d){
+function renderSearch(el, d0){
+  const d = ctxSearchData(d0);
   const rows = d.rows, sm = d.sum;
   const zero = rows.filter(r => r.zero_searches >= 2).sort((a, b) => b.zero_searches - a.zero_searches);
   const miss = rows.filter(r => r.store_units > 0 && r.listed_online === false).sort((a, b) => b.searches - a.searches);
@@ -1294,6 +1522,7 @@ function renderSearch(el, d){
   const head = sm ? (sm.zero_searches ? pct(sm.zero_searches / sm.searches, 0) + ' of searches return no results.' : 'Almost every search returns a result.') : 'What visitors search for on the site.';
   el.innerHTML = lede(head,
       sm ? int(sm.searches) + ' searches in the last 28 days, counted once per visit however many letters were typed (' + int(sm.raw_events) + ' typing events). ' + pct(sm.searches_with_click / sm.searches, 0) + ' went on to click a product.' : 'Last 28 days.') +
+    asideNote(d.aside, r => r.term, 'searches') +
     sec('Searches that returned nothing', 'The site suggests up to four products as people type, so these terms showed none. Add the product, a synonym or a redirect.',
       tbl([{label: 'Search', get: r => esc(r.term)}, {label: 'Searches with no result', num: true, get: r => int(r.zero_searches)}, {label: 'All searches', num: true, get: r => int(r.searches)}, {label: 'Also sold in store', get: r => r.store_product ? esc(r.store_product) : '', cls: 'name'}], zero, {limit: 20, empty: 'No term returned nothing more than once.'})) +
     sec('Searched for, sold in store, not on the website', 'The search term matches the name of a product that sells in store and has no page on the site.',
@@ -1323,7 +1552,8 @@ async function loadProducts(){
   if(rs[0].status === 'rejected') throw rs[0].reason;
   return {rows: rs[0].value, store: val(rs[1]) || [], storeErr: rs[1].status === 'rejected' ? rs[1].reason : null};
 }
-function renderProducts(el, d){
+function renderProducts(el, d0){
+  const d = ctxProductsData(d0);
   const rows = d.rows;
   const flagged = rows.filter(r => r.merch_review), sum = flagged.reduce((t, r) => t + (r.est_gbp_week || 0), 0);
   const q = state.pp.q.trim().toLowerCase();
@@ -1334,10 +1564,11 @@ function renderProducts(el, d){
     tbl([{label: 'Product', get: r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>', cls: 'name'},
          {label: 'Worth a week', num: true, title: 'Estimated weekly sales if the page added to basket at the category median', get: r => r.est_gbp_week ? '<span class="money">' + gbp(r.est_gbp_week) + '</span>' : '\u2013'}, {label: 'Category', get: r => esc(r.category)}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)},
          {label: 'Add to basket', num: true, title: 'Share of visits that added the product to their basket', get: r => pct(r.cart_rate)}, {label: 'Category median', num: true, title: 'The typical add-to-basket rate for pages in the same category', get: r => pct(r.peer_median_cart_rate)}], list, {limit: 40, empty: 'No products match.'}) +
-    findInStore(d, rows) +
+    asideNote(d.aside, r => r.name, 'product pages') +
+    findInStore(d, d.allRows) +
     '<p class="foot">Add-to-basket is the share of visits to the page that added the product. Made-to-order products can convert differently from in-stock ones, and the feed cannot separate them yet, so treat a flag as a prompt to look, not a verdict. Products customers prefer to try in store are not excluded yet.</p>';
-  $('#pq', el).addEventListener('input', e => { state.pp.q = e.target.value; const pos = e.target.selectionStart; renderProducts(el, d); const n = $('#pq', el); n.focus(); n.setSelectionRange(pos, pos); });
-  $('#pf', el).addEventListener('change', e => { state.pp.flagged = e.target.checked; renderProducts(el, d); });
+  $('#pq', el).addEventListener('input', e => { state.pp.q = e.target.value; const pos = e.target.selectionStart; renderProducts(el, d0); const n = $('#pq', el); n.focus(); n.setSelectionRange(pos, pos); });
+  $('#pf', el).addEventListener('change', e => { state.pp.flagged = e.target.checked; renderProducts(el, d0); });
 }
 
 function findInStore(d, rows){
@@ -1471,6 +1702,7 @@ function renderHealth(el, h){
     html += sec('Do Google Ads products match the feed?', 'The share of Shopping spend from ' + dmy(h.shop.ws) + ' to ' + dmy(h.shop.we) + ' that lands on a product in the feed. Below 95% the Shopping tab misses products, usually because the feed table is out of date.',
       '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Shopping spend matched to a feed product</td><td class="num">' + (100 * sh).toFixed(1) + '%</td><td>' + pill(shl) + '</td></tr></tbody></table></div>');
   }
+  html += contextHealth();
   const m = h.mapped, ml = m == null ? 'fix' : m >= 0.95 ? 'good' : m >= 0.9 ? 'check' : 'fix';
   html += sec('Do store products match the website?', 'The share of store sales that lands on a product model in the feed. The opportunity list is reliable from 95%.',
     '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Store sales matched to a model in the feed</td><td class="num">' + (m == null ? '\u2013' : (100 * m).toFixed(1) + '%') + '</td><td>' + pill(ml) + '</td></tr></tbody></table></div>');
@@ -1524,9 +1756,10 @@ function renderGuide(el){
       ['GA4', 'Visits, product views, baskets, checkout steps, searches and orders on the website. Updates daily (built overnight).'],
       ['Ometria orders', 'Order value by channel, online and in store. Reloaded by hand each week.'],
       ['Ometria store products', 'Units and sales by product in the showrooms. Appended by hand each week.'],
-      ['Product feed', 'Product names, categories and links as sent to Google Shopping. Updates as the feed changes.'],
+      ['Product feed', 'Product names, categories, prices and links from the Feedonomics feed file. Reloaded by hand until automatic delivery is set up.'],
       ['Search Console', 'Google searches, impressions, clicks and rankings. Updates daily (built overnight).']
     ].map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('') + '</dl></div>') +
+    contextGuide() +
     sec('Things to keep in mind', '', '<div class="panel"><ul class="plain"><li>Estimates rank opportunities. They are not forecasts.</li><li>Store sales cover a recent period (the date range is in the top right). Seasonal products may look stronger or weaker than usual.</li><li>Made-to-order and in-stock products convert differently and the feed cannot separate them yet.</li><li>If something looks wrong, check <b>Data health</b> first.</li></ul></div>');
 }
 
@@ -1675,7 +1908,7 @@ function slidePlan(pres, ctx){
   [['3 Viewed, not added', n => 'Fix ' + n + ' product ' + plural(n, 'page', 'pages')], ['2 Listed, undiscovered', n => 'Make ' + n + ' ' + plural(n, 'product', 'products') + ' easier to find'], ['4 Under-indexing online', n => 'Push ' + n + ' under-selling ' + plural(n, 'product', 'products')]].forEach(([k, f]) => {
     const l = segList(k); if(l.length) rows.push([[f(l.length)], nameList(l.map(r => r.name), 3, 30), SEG[k].owner, gbpK(sumOpp(l)) + ' over ' + per.months]);
   });
-  const seo = ctx.data.seo;
+  const seo = ctx.data.seo ? ctxSeoData(ctx.data.seo) : null;
   if(seo && seo.ctr.length){
     const pages = [...new Set(seo.ctr.map(r => r.page))], gain = seo.ctr.reduce((t, r) => t + r.ctr_gap_clicks, 0);
     rows.push([['Rewrite titles on ' + pages.length + ' ' + plural(pages.length, 'page', 'pages')], nameList(pages, 3, 26), 'SEO/Content', int(gain) + ' clicks a month']);
@@ -1692,7 +1925,7 @@ function slidePlan(pres, ctx){
   ]);
   const end = pTable(s, y + 0.2, [{label: '#', w: 0.4}, {label: 'Action', w: 2.9}, {label: 'Products, pages or step', w: 4.0}, {label: 'Owner', w: 2.4}, {label: 'Worth (est.)', w: 1.8}, {label: 'Due', w: 0.92}],
     rows.slice(0, 7).map((r, i) => [{text: String(i + 1), bold: true, color: PPT.navy}, {text: head2(r[0][0], 46), bold: true, color: r[0][1] ? PPT.red : PPT.ink}, clip(r[1], 100), clip(r[2], 40), {text: r[3], color: PPT.green, bold: true}, ctx.due]), {size: 10.5, rowH: 0.46});
-  s.addText('Worth is ex-VAT: three months for product groups, a week for alerts and a month for search clicks. Estimates rank the actions and are not forecasts.', {x: 0.45, y: Math.min(end + 0.12, 7.05), w: 12.4, h: 0.3, fontFace: PPT.font, fontSize: 9.5, color: PPT.grey, margin: 0, isTextBox: true});
+  s.addText('Worth is ex-VAT: three months for product groups, a week for alerts and a month for search clicks. Estimates rank the actions and are not forecasts.' + (asideFoot() ? ' ' + asideFoot() : ''), {x: 0.45, y: Math.min(end + 0.12, 7.0), w: 12.4, h: 0.4, fontFace: PPT.font, fontSize: 9.5, color: PPT.grey, margin: 0, isTextBox: true});
   pDone(s, ctx, 'Run down the list top to bottom and agree an owner and a date for each. Product and alert detail follows on the next slides. All of it is in the Opportunities dashboard.');
   return true;
 }
@@ -1717,7 +1950,8 @@ function slideAdd(pres, ctx){
   const end = pTable(s, y + 0.2, [{label: 'Product', w: 5.0}, {label: 'Sold in store', w: 1.4, align: 'right'}, {label: 'Avg price (ex-VAT)', w: 1.7, align: 'right'}, {label: 'Store sales (ex-VAT)', w: 2.0, align: 'right'}, {label: 'Est. missed sales', w: 2.32, align: 'right'}],
     rows.map(r => [clip(r.name, 64), int(r.store_units), r.store_revenue && r.store_units ? gbp(r.store_revenue / r.store_units) : '\u2013', r.store_revenue ? gbp(r.store_revenue) : '\u2013', {text: gbp(r.opportunity), color: PPT.green, bold: true}]));
   pActions(s, panelY(end, acts.length), acts, ctx.due);
-  pDone(s, ctx, n + ' ' + plural(n, 'product', 'products') + ' sold in store over ' + per.span + ' with no page on the website' + (n > rows.length ? ' (the slide shows the top ' + rows.length + '; the full list is in the dashboard, Store gap, with a CSV)' : '') + '. Estimated missed sales compare store units with how much of similar products\u2019 sales happen online, priced at the store average (ex-VAT). It ranks opportunities and is not a forecast. Care kits and removal services are excluded; display pieces may remain.');
+  const af = asideFoot(); if(af) s.addText(af, {x: 0.45, y: 7.3, w: 12.4, h: 0.2, fontFace: PPT.font, fontSize: 9, color: PPT.grey, margin: 0, isTextBox: true});
+  pDone(s, ctx, n + ' ' + plural(n, 'product', 'products') + ' sold in store over ' + per.span + ' with no page on the website' + (n > rows.length ? ' (the slide shows the top ' + rows.length + '; the full list is in the dashboard, Store gap, with a CSV)' : '') + '. Estimated missed sales compare store units with how much of similar products\u2019 sales happen online, priced at the store average (ex-VAT). It ranks opportunities and is not a forecast. Care kits and removal services are excluded; display pieces may remain.' + (asideFoot() ? ' ' + asideFoot() : ''));
   return true;
 }
 function slideGroups(pres, ctx){
@@ -1811,7 +2045,8 @@ function slideCheckout(pres, ctx){
   return true;
 }
 function slideSeo(pres, ctx){
-  const d = ctx.data.seo; if(!d) return false;
+  if(!ctx.data.seo) return false;
+  const d = ctxSeoData(ctx.data.seo);
   if(!d.ctr.length && !d.near.length && !d.drops.length) return false;
   const gain = d.ctr.reduce((t, r) => t + r.ctr_gap_clicks, 0), pagesArr = [...new Set(d.ctr.map(r => r.page))], pages = pagesArr.length;
   const weeks = [...new Set(d.daily.map(r => mondayOf(r.d)))].sort().slice(0, -1).slice(-8);
@@ -1838,7 +2073,8 @@ function slideSeo(pres, ctx){
   return true;
 }
 function slideSearch(pres, ctx){
-  const d = ctx.data.search; if(!d || !d.sum) return false;
+  if(!ctx.data.search || !ctx.data.search.sum) return false;
+  const d = ctxSearchData(ctx.data.search);
   const rows = d.rows, sm = d.sum;
   const miss = rows.filter(r => r.store_units > 0 && r.listed_online === false).sort((a, b) => b.searches - a.searches);
   const zero = rows.filter(r => r.zero_searches >= 2).sort((a, b) => b.zero_searches - a.zero_searches);
@@ -1865,7 +2101,8 @@ function slideSearch(pres, ctx){
   return true;
 }
 function slidePages(pres, ctx){
-  const d = ctx.data.products; if(!d) return false;
+  if(!ctx.data.products) return false;
+  const d = ctxProductsData(ctx.data.products);
   const flagged = d.rows.filter(r => r.merch_review).sort((a, b) => (b.est_gbp_week || 0) - (a.est_gbp_week || 0));
   const fis = d.store || [], fisTotal = fis.reduce((t, r) => t + r.requests, 0);
   if(!flagged.length && !fisTotal) return false;
@@ -1955,7 +2192,7 @@ function checklistItems(sel, data, perList){
     }
   }
   if(has('seo') && data.seo){
-    const d = data.seo, money = g => d.rps ? ' (about ' + gbp(g * d.rps) + ')' : '';
+    const d = ctxSeoData(data.seo), money = g => d.rps ? ' (about ' + gbp(g * d.rps) + ')' : '';
     const byPage = new Map(); d.ctr.forEach(r => { const o = byPage.get(r.page) || {gain: 0, top: r}; o.gain += r.ctr_gap_clicks; if(r.ctr_gap_clicks > o.top.ctr_gap_clicks) o.top = r; byPage.set(r.page, o); });
     cap([...byPage.entries()].sort((a, b) => b[1].gain - a[1].gain)).forEach(([page, o]) => push('Organic search wins', 'Rewrite title and meta', 'Landing page',
       {item: page, link: site(page), owner: 'SEO/Content', worth: int(o.gain) + ' clicks a month' + money(o.gain), what: 'Rewrite the title (about 60 characters) and meta description around \u201C' + o.top.query + '\u201D. Check for an AI Overview or Shopping box above the result.', evidence: 'Position ' + o.top.avg_position.toFixed(1) + ', click-through ' + pct(o.top.ctr) + ' against ' + pct(o.top.expected_ctr) + ' expected.'}));
@@ -1966,7 +2203,7 @@ function checklistItems(sel, data, perList){
       {item: r.page, link: site(r.page), owner: 'SEO/Content', worth: int(r.clicks_prior - r.clicks_cur) + ' fewer clicks', what: 'Check the page loads, is not blocked or noindex, redirects and canonicals are unchanged, and the product is still in the feed.', evidence: 'Clicks ' + int(r.clicks_cur) + ' against ' + int(r.clicks_prior) + ' (' + pct(r.change_pct, 0) + '); average position ' + (r.pos_cur == null ? '\u2013' : r.pos_cur.toFixed(1)) + ' against ' + (r.pos_prior == null ? '\u2013' : r.pos_prior.toFixed(1)) + '.'}));
   }
   if(has('search') && data.search){
-    const rows = data.search.rows;
+    const rows = ctxSearchData(data.search).rows;
     cap(rows.filter(r => r.store_units > 0 && r.listed_online === false).sort((a, b) => b.searches - a.searches)).forEach(r => push('Site search', 'List the product people search for', 'Search term',
       {item: r.term, owner: 'Product and Range, eCommerce', worth: int(r.searches) + ' searches', what: 'Check \u201C' + r.store_product + '\u201D is current range and add it to the website.', evidence: int(r.searches) + ' searches in 28 days. Sold in store: ' + int(r.store_units) + ' (' + r.store_product + ').'}));
     cap(rows.filter(r => r.zero_searches >= 2).sort((a, b) => b.zero_searches - a.zero_searches)).forEach(r => push('Site search', 'Fix a search that returns nothing', 'Search term',
@@ -1975,7 +2212,7 @@ function checklistItems(sel, data, perList){
       {item: r.term, owner: 'eCommerce', worth: int(r.searches) + ' searches', what: 'Change what the preview shows, or rename or re-rank the product.', evidence: pct(r.click_rate, 0) + ' of searchers clicked a product.'}));
   }
   if(has('pages') && data.products){
-    const d = data.products, byId = new Map(d.rows.map(r => [r.id, r]));
+    const d = ctxProductsData(data.products), byId = new Map((d.allRows || d.rows).map(r => [r.id, r]));
     cap(d.rows.filter(r => r.merch_review).sort((a, b) => (b.est_gbp_week || 0) - (a.est_gbp_week || 0))).forEach(r => push('Product pages to fix', 'Review the product page', 'Product page',
       {item: r.name, code: r.id, link: r.url && r.url !== '/' ? site(r.url) : '', owner: 'eCommerce', worth: gbp(r.est_gbp_week) + ' a week', what: 'Open the page as a customer. Check price, delivery time, images, dimensions and options.', evidence: int(r.pdp_sessions) + ' visits; ' + pct(r.cart_rate) + ' add to basket against ' + pct(r.peer_median_cart_rate) + ' for the category.'}));
     const prods = new Map(); (d.store || []).forEach(r => { const k = r.product_name || '(unknown)'; const o = prods.get(k) || {name: k, id: r.product_group_id, n: 0}; o.n += r.requests; if(!o.id) o.id = r.product_group_id; prods.set(k, o); });
@@ -1984,7 +2221,7 @@ function checklistItems(sel, data, perList){
   }
   return items;
 }
-function buildChecklistWorkbook(items, label, due, perList){
+function buildChecklistWorkbook(items, label, due, perList, aside){
   const wb = new window.ExcelJS.Workbook(); wb.creator = 'Barker and Stonehouse'; wb.title = 'Opportunities checklist';
   wb.calcProperties = {fullCalcOnLoad: true};
   const NAVY = 'FF1F3864', HEAD = 'FF2F4F8F', LINE = 'FFD5DAE3', GREY = 'FF5A6472';
@@ -2050,6 +2287,13 @@ function buildChecklistWorkbook(items, label, due, perList){
   table(r1, 'Progress by owner', ['Owner', 'Items', 'Done', '% done'], rowsO);
   for(let i = 0; i < owners.length; i++) sm.getCell('D' + (r1 + 2 + i)).numFmt = '0%';
   sm.pageSetup = {orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0, paperSize: 9};
+  if(aside && aside.length){
+    const as = wb.addWorksheet('Set aside');
+    as.columns = [{header: 'Area', width: 30}, {header: 'Item', width: 46}, {header: 'Why it is set aside', width: 90}, {header: 'Value', width: 24}];
+    as.getRow(1).eachCell(c => { c.font = {name: 'Calibri', bold: true, color: {argb: 'FFFFFFFF'}}; c.fill = {type: 'pattern', pattern: 'solid', fgColor: {argb: HEAD}}; c.border = border; });
+    aside.forEach(o => { const r = as.addRow([o.area, o.item, o.why, o.value]); r.alignment = {vertical: 'top', wrapText: true}; r.font = {name: 'Calibri', size: 10.5}; });
+    as.views = [{state: 'frozen', ySplit: 1}];
+  }
   return wb;
 }
 async function exportChecklist(sel, label, due, perList, onStatus){
@@ -2063,7 +2307,7 @@ async function exportChecklist(sel, label, due, perList, onStatus){
   onStatus('Building the checklist\u2026');
   const items = checklistItems(sel, data, perList);
   if(!items.length) throw new Error('None of the chosen slides had items to list.');
-  const wb = buildChecklistWorkbook(items, label, due, perList);
+  const wb = buildChecklistWorkbook(items, label, due, perList, collectAside(data));
   const buf = await wb.xlsx.writeBuffer();
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));
