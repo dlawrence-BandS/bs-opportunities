@@ -260,7 +260,7 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
   <div id="exportList" class="optlist"></div>
   <label class="field">Label, top right of each slide<input id="exportLabel" type="text"></label>
   <label class="field">Due date shown against each action<input id="exportDue" type="text"></label>
-  <label class="field">Items per list on the checklist<input id="exportPer" type="number" min="5" max="200" value="25"></label>
+  <label class="field">Items per list on the checklist<input id="exportPer" type="number" min="5" max="200" value="10"></label>
   <label class="check"><input type="checkbox" id="exportNotes" checked> Add speaker notes</label>
   <p id="exportMsg" class="exportmsg" role="status"></p>
   <div class="dlgact"><button type="button" class="btn quiet" id="exportCancel">Close</button><button type="button" class="btn quiet" id="checklistGo">Download checklist (Excel)</button><button type="button" class="btn" id="exportGo">Download slides</button></div>
@@ -370,8 +370,9 @@ FROM ${T('bs_marts.checkout_errors_daily')}`,
   listItems: `SELECT list_name, product_group_id, product_name, clicks FROM ${T('bs_marts.plp_top_items_28d')} ORDER BY clicks DESC LIMIT 100`,
   products: `
 SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, pdp_sessions, cart_sessions,
-  cart_rate, peer_median_cart_rate, est_gbp_week, merch_review
+  cart_rate, peer_median_cart_rate, est_gbp_week, merch_review, in_stock_share
 FROM ${T('bs_marts.pdp_scorecard')} ORDER BY est_gbp_week DESC LIMIT 2000`,
+  searchEffect: `SELECT SUM(sessions) AS s, SUM(search_sessions) AS ss, SUM(search_purchase_sessions) AS sp, SUM(purchase_all_sessions) AS pa FROM ${T('bs_marts.checkout_funnel_daily')} WHERE event_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 28 DAY)`,
   funnel: `
 SELECT CAST(event_date AS STRING) AS d, device, sessions, pdp_sessions, cart_sessions, checkout_sessions,
   shipping_sessions, payment_sessions, purchase_sessions, revenue
@@ -483,6 +484,7 @@ const SEG = Object.fromEntries(SEGMENTS.map(s => [s.key, s]));
 const RULES = {
   PDP_MERCH_REVIEW: 'Product page review', CHECKOUT_STEP_BREAK: 'Checkout step dropped', CHECKOUT_FORM_ERRORS: 'Checkout form errors',
   HIDDEN_GEM: 'Hidden gem', STORE_BESTSELLER_GAP: 'Store bestseller under-indexing',
+  PDP_OUT_OF_STOCK: 'Popular page, nothing in stock', DEVICE_GAP: 'Mobile checkout converts less', SEARCH_CONVERTS: 'Site search is under-used',
   SHOP_WASTED_SPEND: 'Shopping spend with no sales', SHOP_OOS_SPEND: 'Shopping spend on out-of-stock items', SHOP_SCALE: 'Shopping product to scale', SHOP_STORE_NO_ADS: 'Store bestseller missing from Shopping', SEO_CTR: 'Rewrite title and meta', SEO_DROP: 'Organic visibility drop'
 };
 const PLAYBOOK = {
@@ -513,6 +515,21 @@ const PLAYBOOK = {
     why: 'The demand is proven in store, so the gap is the size of the online opportunity.',
     steps: ['Open Store gap and find this product to see which group it is in and why.', 'Follow the steps for that group: add it, make it findable, fix the page or push traffic.'],
     done: 'Its online share of sales moves towards that of similar products.'},
+  PDP_OUT_OF_STOCK: {
+    means: 'This product page is among the busier ones, but no variant shows as in stock in the feed.',
+    why: 'Visitors arrive wanting to buy and cannot. Without a next step they leave for a competitor.',
+    steps: ['Check on the site that it really is out of stock, because the dashboard\u2019s feed file may differ from the live page.', 'Add a back-in-stock sign-up and a message with the expected date.', 'Show similar products that are available, or a made-to-order option if there is one.', 'If it is not coming back, redirect the page to the nearest equivalent.'],
+    done: 'Visitors to the page click through to an alternative or sign up, and the page stops being a dead end.'},
+  DEVICE_GAP: {
+    means: 'Of the visits that start checkout on a phone, a much smaller share buy than on desktop.',
+    why: 'Most visits are on mobile, so a gap at checkout costs sales every day. A phone-specific fault is common and cheap to fix.',
+    steps: ['Place test orders on a phone, on iPhone and Android, from basket to payment.', 'Check each form: the right keyboard for each field, autofill, button size, and error messages that can be read.', 'Check wallet and finance options load and work on mobile.', 'Compare with the Form errors on the Checkout tab for a step that fails more often on mobile.'],
+    done: 'The mobile checkout rate moves towards the desktop rate over two to four weeks.'},
+  SEARCH_CONVERTS: {
+    means: 'Visits that use the site search buy at a much higher rate than those that do not, but only a small share of visits use it.',
+    why: 'If more visitors found and used search, more would reach products they want. This is a cheap test with a clear measure.',
+    steps: ['Test a more prominent search box on mobile and desktop, for example an icon that opens a full-width box.', 'Show product suggestions as people type, with images.', 'Compare the share of visits that use search, and their conversion, before and after.', 'Remember searchers are already high intent, so judge the test on the change in overall conversion.'],
+    done: 'A higher share of visits use search without overall conversion falling.'},
   SHOP_WASTED_SPEND: {
     means: 'This product has taken a meaningful amount of Google Shopping spend in the last 28 days without a single sale.',
     why: 'That spend could go to products that do sell. Often the cause is a price, stock or page problem rather than the ad.',
@@ -1510,8 +1527,15 @@ function renderLanding(el, d){
 
 /* ---------- site search ---------- */
 async function loadSearch(){
-  const rs = await Promise.all([bq(SQL.searchTerms), bq(SQL.searchSummary)]);
-  return {rows: rs[0], sum: rs[1][0] || null};
+  const rs = await Promise.all([bq(SQL.searchTerms), bq(SQL.searchSummary), bq(SQL.searchEffect).catch(() => null)]);
+  return {rows: rs[0], sum: rs[1][0] || null, effect: rs[2] && rs[2][0] && rs[2][0].ss ? rs[2][0] : null};
+}
+function searchEffectHtml(e){
+  if(!e || !e.s || e.s === e.ss) return '';
+  const a = e.sp / e.ss, b = (e.pa - e.sp) / (e.s - e.ss), use = e.ss / e.s;
+  if(!(a > 0) || !(b > 0)) return '';
+  return sec('Do visitors who search buy more?', 'Visits that use search buy at ' + pct(a, 1) + ', against ' + pct(b, 1) + ' for visits that do not (' + (a / b).toFixed(1) + ' times as often). Only ' + pct(use, 0) + ' of visits use search.' +
+    (a >= 1.5 * b && use < 0.25 ? ' That is a reason to test a more prominent search box, especially on mobile. Searchers are already high intent, so treat it as a test and not a promise.' : ''), '');
 }
 function renderSearch(el, d0){
   const d = ctxSearchData(d0);
@@ -1522,6 +1546,7 @@ function renderSearch(el, d0){
   const head = sm ? (sm.zero_searches ? pct(sm.zero_searches / sm.searches, 0) + ' of searches return no results.' : 'Almost every search returns a result.') : 'What visitors search for on the site.';
   el.innerHTML = lede(head,
       sm ? int(sm.searches) + ' searches in the last 28 days, counted once per visit however many letters were typed (' + int(sm.raw_events) + ' typing events). ' + pct(sm.searches_with_click / sm.searches, 0) + ' went on to click a product.' : 'Last 28 days.') +
+    searchEffectHtml(d.effect) +
     asideNote(d.aside, r => r.term, 'searches') +
     sec('Searches that returned nothing', 'The site suggests up to four products as people type, so these terms showed none. Add the product, a synonym or a redirect.',
       tbl([{label: 'Search', get: r => esc(r.term)}, {label: 'Searches with no result', num: true, get: r => int(r.zero_searches)}, {label: 'All searches', num: true, get: r => int(r.searches)}, {label: 'Also sold in store', get: r => r.store_product ? esc(r.store_product) : '', cls: 'name'}], zero, {limit: 20, empty: 'No term returned nothing more than once.'})) +
@@ -1556,6 +1581,7 @@ function renderProducts(el, d0){
   const d = ctxProductsData(d0);
   const rows = d.rows;
   const flagged = rows.filter(r => r.merch_review), sum = flagged.reduce((t, r) => t + (r.est_gbp_week || 0), 0);
+  const noStock = rows.filter(r => r.in_stock_share === 0 && r.pdp_sessions >= 200).sort((a, b) => b.pdp_sessions - a.pdp_sessions);
   const q = state.pp.q.trim().toLowerCase();
   const list = rows.filter(r => (!state.pp.flagged || r.merch_review) && (!q || (r.name || '').toLowerCase().includes(q) || r.id.toLowerCase().includes(q)));
   el.innerHTML = lede(flagged.length ? flagged.length + ' popular product ' + plural(flagged.length, 'page converts', 'pages convert') + ' to basket well below similar products.' : 'No product pages stand out for weak add-to-basket.',
@@ -1565,6 +1591,8 @@ function renderProducts(el, d0){
          {label: 'Worth a week', num: true, title: 'Estimated weekly sales if the page added to basket at the category median', get: r => r.est_gbp_week ? '<span class="money">' + gbp(r.est_gbp_week) + '</span>' : '\u2013'}, {label: 'Category', get: r => esc(r.category)}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)},
          {label: 'Add to basket', num: true, title: 'Share of visits that added the product to their basket', get: r => pct(r.cart_rate)}, {label: 'Category median', num: true, title: 'The typical add-to-basket rate for pages in the same category', get: r => pct(r.peer_median_cart_rate)}], list, {limit: 40, empty: 'No products match.'}) +
     asideNote(d.aside, r => r.name, 'product pages') +
+    (noStock.length ? sec('Popular pages with nothing in stock', noStock.length + ' ' + plural(noStock.length, 'page gets', 'pages get') + ' at least 200 visits in 28 days, with no variant in stock in the feed. Add a back-in-stock sign-up and show alternatives, or redirect if it is not coming back. Check the live page first, because the feed file can differ from the site.',
+      tbl([{label: 'Product', get: r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>', cls: 'name'}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)}, {label: 'Category', get: r => esc(r.category)}], noStock, {limit: 15})) : '') +
     findInStore(d, d.allRows) +
     '<p class="foot">Add-to-basket is the share of visits to the page that added the product. Made-to-order products can convert differently from in-stock ones, and the feed cannot separate them yet, so treat a flag as a prompt to look, not a verdict. Products customers prefer to try in store are not excluded yet.</p>';
   $('#pq', el).addEventListener('input', e => { state.pp.q = e.target.value; const pos = e.target.selectionStart; renderProducts(el, d0); const n = $('#pq', el); n.focus(); n.setSelectionRange(pos, pos); });
@@ -1615,6 +1643,7 @@ function renderCheckout(el, d){
   el.innerHTML = lede(chkCompl != null ? pct(chkCompl, 0) + ' of visits that start checkout go on to buy.' : 'Checkout over the last 28 days.', 'Each step counts visits that reached it, so a step cannot be higher than the one before it. Bought counts visits that started checkout and completed an order.') +
     '<div class="filters"><label class="sr" for="dev">Device</label><select id="dev"><option value="">All devices</option>' + devices.map(t => '<option' + (state.co.device === t ? ' selected' : '') + '>' + esc(t) + '</option>').join('') + '</select></div>' +
     '<div class="panel">' + funnel + '</div>' +
+    deviceSection(all, last28) +
     sec('Completion over time', 'Seven-day rolling rates. A sudden step down in either line is what the checkout alert watches for.', '<div class="panel">' + chartBox('cochart', 'Line chart of basket to checkout and checkout to purchase rates') + '</div>') +
     sec('Last 14 days', '', tbl([{label: 'Day', get: r => dm(r.d)}, {label: 'Visits', num: true, get: r => int(r.v)}, {label: 'Baskets', num: true, get: r => int(r.c)}, {label: 'Checkouts', num: true, get: r => int(r.k)}, {label: 'Bought', num: true, get: r => int(r.p)},
          {label: 'Basket to checkout', num: true, get: r => r.c ? pct(r.k / r.c, 0) : '\u2013'}, {label: 'Checkout to bought', num: true, get: r => r.k ? pct(r.p / r.k, 0) : '\u2013'}], tail, {limit: 14})) +
@@ -1627,6 +1656,19 @@ function renderCheckout(el, d){
     options: {responsive: true, maintainAspectRatio: false, scales: {x: {grid: {display: false}, ticks: {maxTicksLimit: 8, maxRotation: 0}}, y: {ticks: {callback: v => v + '%'}, grid: {color: '#e8e5e0'}}}, plugins: {legend: {position: 'bottom', labels: {boxWidth: 12, boxHeight: 12}}}}});
 }
 
+function deviceSection(all, last28){
+  const devs = [...new Set(all.map(r => r.device))].filter(x => x && x !== 'unknown').sort();
+  if(devs.length < 2) return '';
+  const sumD = (dev, k) => all.filter(r => r.device === dev && last28.includes(r.d)).reduce((t, r) => t + r[k], 0);
+  const rows = devs.map(v => ({v, n: sumD(v, 'sessions'), pdp: sumD(v, 'pdp_sessions'), cart: sumD(v, 'cart_sessions'), chk: sumD(v, 'checkout_sessions'), buy: sumD(v, 'purchase_sessions'), rev: sumD(v, 'revenue')}));
+  const ratio = (a, b) => b ? a / b : null;
+  const best = Math.max(...rows.filter(r => r.chk >= 100).map(r => ratio(r.buy, r.chk) || 0), 0);
+  const total = rows.reduce((t, r) => t + r.n, 0);
+  const worst = rows.filter(r => r.chk >= 100 && best && ratio(r.buy, r.chk) < 0.85 * best).sort((a, b) => ratio(a.buy, a.chk) - ratio(b.buy, b.chk))[0];
+  return sec('By device', worst ? 'On ' + worst.v + ', ' + pct(ratio(worst.buy, worst.chk), 0) + ' of visits that start checkout buy, against ' + pct(best, 0) + ' on the best device. ' + worst.v.charAt(0).toUpperCase() + worst.v.slice(1) + ' is ' + pct(worst.n / total, 0) + ' of visits, so test the checkout on it.' : 'Checkout conversion is similar across devices.',
+    tbl([{label: 'Device', get: r => esc(r.v)}, {label: 'Visits', num: true, get: r => int(r.n)}, {label: 'Share', num: true, get: r => pct(r.n / total, 0)}, {label: 'Add to basket', num: true, title: 'Of visits to a product page', get: r => pct(ratio(r.cart, r.pdp), 1)},
+         {label: 'Checkout to bought', num: true, get: r => pct(ratio(r.buy, r.chk), 0)}, {label: 'Revenue per visit', num: true, get: r => r.n ? '\u00A3' + (r.rev / r.n).toFixed(2) : '\u2013'}], rows, {limit: 6}));
+}
 function checkoutErrorsHtml(d){
   if(d.errErr) return '<div class="banner"><strong>Checkout errors are missing.</strong> Re-run 01_build_europe-west2.sql to add them. BigQuery said: ' + esc(d.errErr.message) + '</div>';
   if(!d.errors.length) return '';
@@ -1869,7 +1911,15 @@ function slideIntro(pres, ctx){
   pDone(s, ctx, 'Opening slide for the Opportunities section. The headline is the estimated online sales missed across every product that sells in store and under-sells online (ex-VAT, over ' + per.months + '). It ranks opportunities and is not a forecast.');
   return true;
 }
-const nextMonday = () => { const d = new Date(); d.setDate(d.getDate() + ((8 - d.getDay()) % 7 || 7)); return d.toLocaleDateString('en-GB', {weekday: 'short', day: 'numeric', month: 'short'}); };
+const defaultDue = () => { const d = new Date(), add = (5 - d.getDay() + 7) % 7 || 7; d.setDate(d.getDate() + add); return d.toLocaleDateString('en-GB', {weekday: 'short'}) + ' ' + d.getDate() + ' ' + d.toLocaleDateString('en-GB', {month: 'short'}); };
+/* label in the style of the weekly pack: the last complete Monday to Sunday week. Week 26 was 21 to 27 Sep 2026. */
+function weekLabel(){
+  const now = new Date(), day = (now.getDay() + 6) % 7;
+  const mon = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day - 7), sun = new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + 6);
+  const wk = 26 + Math.round((mon - new Date(2026, 8, 21)) / (7 * 864e5));
+  const mo = d => d.toLocaleDateString('en-GB', {month: 'short'});
+  return 'Week ' + wk + '  \u00B7  ' + mon.getDate() + (mon.getMonth() === sun.getMonth() ? '' : ' ' + mo(mon)) + ' to ' + sun.getDate() + ' ' + mo(sun) + ' ' + sun.getFullYear();
+}
 const nameList = (arr, n, len) => arr.slice(0, n).map(x => clip(x, len || 30)).join('  \u00B7  ') + (arr.length > n ? '  \u00B7  and ' + (arr.length - n) + ' more' : '');
 const firstMore = (arr, len) => clip(arr[0], len || 40) + (arr.length > 1 ? ' and ' + (arr.length - 1) + ' more' : '');
 const segList = key => state.rows.filter(r => r.segment === key).sort((a, b) => b.opportunity - a.opportunity);
@@ -2111,7 +2161,7 @@ function slidePages(pres, ctx){
   const topStore = [...stores.entries()].sort((a, b) => b[1] - a[1])[0];
   const prods = new Map(); fis.forEach(r => { const k = r.product_name || '(unknown)'; const o = prods.get(k) || {name: k, n: 0}; o.n += r.requests; prods.set(k, o); });
   const topProds = [...prods.values()].sort((a, b) => b.n - a.n);
-  const title = flagged.length ? 'Fix ' + flagged.length + ' product ' + plural(flagged.length, 'page', 'pages') + ' that lose visitors' : 'Products customers want to see in store';
+  const title = flagged.length ? 'Fix ' + flagged.length + ' product ' + plural(flagged.length, 'page that loses', 'pages that lose') + ' visitors' : 'Products customers want to see in store';
   const s = pBase(pres, head2(title, 60), 'Popular pages that lose visitors before the basket  \u00B7  last 28 days' + (sum ? '  \u00B7  worth about ' + gbpK(sum) + ' a week' : ''), ctx.label);
   const y = pCards(s, [
     {label: 'PAGES FLAGGED', value: String(flagged.length), delta: 'well below category', tone: flagged.length ? 'bad' : 'good', sub: 'busy pages, weak add to basket'},
@@ -2120,8 +2170,11 @@ function slidePages(pres, ctx){
     {label: 'TOP SHOWROOM', value: topStore ? topStore[0] : '\u2013', delta: topStore ? int(topStore[1]) + ' requests' : '', sub: 'for find in store'}
   ]);
   const acts = [];
+  const noStockPg = d.rows.filter(r => r.in_stock_share === 0 && r.pdp_sessions >= 200).sort((a, b) => b.pdp_sessions - a.pdp_sessions);
+  if(noStockPg.length) acts.push({lead: 'Handle ' + noStockPg.length + ' popular ' + plural(noStockPg.length, 'page', 'pages') + ' with nothing in stock', rest: firstMore(noStockPg.map(r => r.name), 34) + ': add a back-in-stock sign-up and show alternatives.', owner: 'eCommerce'});
   if(flagged.length) acts.push({lead: 'Review ' + firstMore(flagged.map(r => r.name), 36), rest: 'Check price, delivery time, images, dimensions and options as a customer would.', owner: 'eCommerce'});
   if(topProds.length) acts.push({lead: 'Add a swatch or showroom prompt on ' + firstMore(topProds.map(r => r.name), 36), rest: 'Most find-in-store requests (' + topProds.slice(0, 2).map(r => r.n).join(' and ') + '): customers want to try these first.', owner: 'eCommerce, Showrooms'});
+  acts.sort((a, b) => (a.lead.startsWith('Review') ? 0 : 1) - (b.lead.startsWith('Review') ? 0 : 1));
   const rowsT = flagged.slice(0, maxRows(y + 0.2, acts.length, 0.3));
   const end = flagged.length
     ? pTable(s, y + 0.2, [{label: 'Product', w: 4.4}, {label: 'Category', w: 2.0}, {label: 'Visits', w: 1.4, align: 'right'}, {label: 'Add to basket', w: 1.5, align: 'right'}, {label: 'Category median', w: 1.6, align: 'right'}, {label: 'Worth a week', w: 1.52, align: 'right'}],
@@ -2173,7 +2226,7 @@ function checklistItems(sel, data, perList){
       push('Fix, find and push', SEG[k].label, k === '0 Check mapping' ? 'Store code' : 'Product', {item: r.name, code: r.id, link: r.url && r.url !== '/' ? site(r.url) : '', owner: SEG[k].owner, worth: gbp(r.opportunity) + ' over ' + per.months, what: x.next, evidence: x.why}); }));
   }
   if(has('alerts') && data.actions){
-    const covered = r => (r.rule_code.startsWith('SEO') && has('seo')) || (r.rule_code === 'PDP_MERCH_REVIEW' && has('pages')) || (r.rule_code === 'STORE_BESTSELLER_GAP' && (has('add') || has('groups')));
+    const covered = r => (r.rule_code.startsWith('SEO') && has('seo')) || ((r.rule_code === 'PDP_MERCH_REVIEW' || r.rule_code === 'PDP_OUT_OF_STOCK') && has('pages')) || (r.rule_code === 'STORE_BESTSELLER_GAP' && (has('add') || has('groups')));
     actionRows(data.actions).filter(r => r.confirmed && !covered(r)).sort((a, b) => (a.priority === 'P1' ? 0 : 1) - (b.priority === 'P1' ? 0 : 1) || (b.gbp || 0) - (a.gbp || 0)).forEach(r => {
       const isPage = String(r.entity_name).startsWith('/');
       push('Alerts to action', (r.priority === 'P1' ? 'URGENT: ' : '') + (RULES[r.rule_code] || r.rule_code), r.rule_code.startsWith('CHECKOUT') ? 'Checkout step' : isPage ? 'Landing page' : 'Product',
@@ -2215,6 +2268,8 @@ function checklistItems(sel, data, perList){
     const d = ctxProductsData(data.products), byId = new Map((d.allRows || d.rows).map(r => [r.id, r]));
     cap(d.rows.filter(r => r.merch_review).sort((a, b) => (b.est_gbp_week || 0) - (a.est_gbp_week || 0))).forEach(r => push('Product pages to fix', 'Review the product page', 'Product page',
       {item: r.name, code: r.id, link: r.url && r.url !== '/' ? site(r.url) : '', owner: 'eCommerce', worth: gbp(r.est_gbp_week) + ' a week', what: 'Open the page as a customer. Check price, delivery time, images, dimensions and options.', evidence: int(r.pdp_sessions) + ' visits; ' + pct(r.cart_rate) + ' add to basket against ' + pct(r.peer_median_cart_rate) + ' for the category.'}));
+    cap(d.rows.filter(r => r.in_stock_share === 0 && r.pdp_sessions >= 200).sort((a, b) => b.pdp_sessions - a.pdp_sessions)).forEach(r => push('Product pages to fix', 'Handle a page with nothing in stock', 'Product page',
+      {item: r.name, code: r.id, link: r.url && r.url !== '/' ? site(r.url) : '', owner: 'eCommerce', worth: int(r.pdp_sessions) + ' visits in 28 days', what: 'Check it on the site, add a back-in-stock sign-up and show alternatives, or redirect it if it is not coming back.', evidence: 'No variant shows as in stock in the feed.'}));
     const prods = new Map(); (d.store || []).forEach(r => { const k = r.product_name || '(unknown)'; const o = prods.get(k) || {name: k, id: r.product_group_id, n: 0}; o.n += r.requests; if(!o.id) o.id = r.product_group_id; prods.set(k, o); });
     cap([...prods.values()].sort((a, b) => b.n - a.n)).forEach(o => { const m = o.id ? byId.get(o.id) : null;
       push('Product pages to fix', 'Add a swatch or showroom prompt', 'Product', {item: o.name, code: o.id || '', link: m && m.url && m.url !== '/' ? site(m.url) : '', owner: 'eCommerce, Showrooms', worth: int(o.n) + ' find-in-store requests', what: 'Customers want to try this first. Add a swatch or showroom prompt on the page.', evidence: int(o.n) + ' find-in-store clicks in 28 days' + (m ? '; ' + pct(m.cart_rate) + ' add to basket.' : '.')}); });
@@ -2319,8 +2374,8 @@ async function exportChecklist(sel, label, due, perList, onStatus){
 function openExport(){
   const dlg = $('#exportDlg'); if(!dlg.showModal) return;
   $('#exportList').innerHTML = SLIDE_OPTIONS.map(o => '<label class="opt"><input type="checkbox" name="sl" value="' + o[0] + '" checked><span><b>' + esc(o[1]) + '</b><small>' + esc(o[2]) + '</small></span></label>').join('');
-  $('#exportLabel').value = 'Opportunities  \u00B7  ' + new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'short', year: 'numeric'});
-  $('#exportDue').value = nextMonday();
+  $('#exportLabel').value = weekLabel();
+  $('#exportDue').value = defaultDue();
   $('#exportMsg').textContent = ''; $('#exportGo').disabled = false;
   dlg.showModal();
 }
@@ -2332,7 +2387,7 @@ function wireExport(){
     if(!sel.length){ msg.textContent = 'Choose at least one slide.'; return; }
     go.disabled = true; $('#checklistGo').disabled = true;
     try {
-      const r = await exportSlides(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportNotes').checked, $('#exportDue').value.trim() || nextMonday(), t => { msg.textContent = t; });
+      const r = await exportSlides(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportNotes').checked, $('#exportDue').value.trim() || defaultDue(), t => { msg.textContent = t; });
       msg.textContent = 'Downloaded ' + r.made.length + ' ' + plural(r.made.length, 'slide', 'slides') + '.' + (r.empty.length ? ' Left out because there was nothing to show: ' + r.empty.join(', ') + '.' : '') + (r.unavailable.length ? ' Could not load: ' + r.unavailable.join(', ') + '.' : '') + ' Open the file, copy the slides and paste them at the end of the deck.';
     } catch(e) { msg.textContent = 'Could not make the slides: ' + (e && e.message ? e.message : e); }
     go.disabled = false; $('#checklistGo').disabled = false;
@@ -2342,8 +2397,8 @@ function wireExport(){
     if(!sel.length){ msg.textContent = 'Choose at least one slide.'; return; }
     go.disabled = true; cg.disabled = true;
     try {
-      const per = Math.max(5, Math.min(200, parseInt($('#exportPer').value, 10) || 25));
-      const r = await exportChecklist(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportDue').value.trim() || nextMonday(), per, t => { msg.textContent = t; });
+      const per = Math.max(5, Math.min(200, parseInt($('#exportPer').value, 10) || 10));
+      const r = await exportChecklist(sel, $('#exportLabel').value.trim() || 'Opportunities', $('#exportDue').value.trim() || defaultDue(), per, t => { msg.textContent = t; });
       msg.textContent = 'Downloaded the checklist with ' + r.count + ' ' + plural(r.count, 'item', 'items') + '.' + (r.unavailable.length ? ' Could not load: ' + r.unavailable.join(', ') + '.' : '') + ' Share it with the team and ask them to set each row to Done.';
     } catch(e) { msg.textContent = 'Could not make the checklist: ' + (e && e.message ? e.message : e); }
     go.disabled = false; cg.disabled = false;
