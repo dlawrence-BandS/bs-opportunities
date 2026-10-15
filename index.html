@@ -225,6 +225,7 @@ th[title],th button[title]{cursor:help;text-decoration:underline dotted;text-und
 .ver{color:var(--muted);font-size:.8rem;padding:8px 0 40px}
 @media print{.ver{display:none}}
 .pill.aside{color:var(--muted)}
+.notetxt{display:block;color:var(--slate);font-size:.82rem;margin-top:2px;max-width:34em}
 .asidenote{background:var(--paper);border:1px solid var(--line);border-left:4px solid #b9bcc4;border-radius:0 6px 6px 0;margin:14px 0 18px;padding:10px 16px;font-size:.92rem}
 .asidenote p{margin:4px 0 0;color:var(--muted)}
 .asidenote summary{cursor:pointer}
@@ -292,6 +293,8 @@ WITH titles AS (
   GROUP BY mk
 )
 SELECT g.product_group_id AS id,
+  g.item_status AS item_status,
+  g.item_status_source AS item_status_source,
   COALESCE(g.product_name, t.store_title) AS name,
   COALESCE(g.category, 'Uncategorised') AS category,
   g.gap_segment AS segment,
@@ -371,7 +374,7 @@ FROM ${T('bs_marts.checkout_errors_daily')}`,
   listItems: `SELECT list_name, product_group_id, product_name, clicks FROM ${T('bs_marts.plp_top_items_28d')} ORDER BY clicks DESC LIMIT 100`,
   products: `
 SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, pdp_sessions, cart_sessions,
-  cart_rate, peer_median_cart_rate, est_gbp_week, merch_review, in_stock_share
+  cart_rate, peer_median_cart_rate, est_gbp_week, merch_review, in_stock_share, item_status
 FROM ${T('bs_marts.pdp_scorecard')} ORDER BY est_gbp_week DESC LIMIT 2000`,
   searchEffect: `SELECT SUM(sessions) AS s, SUM(search_sessions) AS ss, SUM(search_purchase_sessions) AS sp, SUM(purchase_all_sessions) AS pa FROM ${T('bs_marts.checkout_funnel_daily')} WHERE event_date >= DATE_SUB(CURRENT_DATE('Europe/London'), INTERVAL 28 DAY)`,
   funnel: `
@@ -401,6 +404,10 @@ FROM f`,
   shopSummary: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, impressions, clicks, cost, conversions, conv_value, cost_matched, oos_cost FROM ${T('bs_marts.shopping_summary_28d')}`,
   shopModels: `SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, impressions, clicks, cost, conversions, conv_value, roas, oos_clicks, oos_cost, store_units, gap_segment FROM ${T('bs_marts.shopping_by_model_28d')} ORDER BY cost DESC LIMIT 3000`,
   shopGaps: `SELECT product_group_id AS id, product_name AS name, store_units, store_revenue, gap_segment, shopping_impressions FROM ${T('bs_marts.shopping_store_gaps_28d')} ORDER BY store_revenue DESC LIMIT 100`,
+  modelStatus: `SELECT model_key AS id, item_status, n_items, n_current, n_selling_off, n_ended FROM ${T('bs_core.model_status')}`,
+  statusMeta: `SELECT CAST(MAX(loaded_on) AS STRING) AS loaded_on, COUNT(*) AS items FROM ${T('bs_core.item_status')}`,
+  statusCover: `SELECT (SELECT SAFE_DIVIDE(SUM(IF(ms.model_key IS NOT NULL, s.revenue_ex_vat, 0)), SUM(s.revenue_ex_vat)) FROM ${T('ometria.store_product_sales')} AS s LEFT JOIN ${T('bs_core.model_status')} AS ms ON ms.model_key = ${T('bs_core.model_key')}(s.sku)) AS store_cover,
+  COUNTIF(item_status = 'Current') AS feed_current, COUNTIF(item_status = 'Selling off') AS feed_selling_off, COUNTIF(item_status = 'Ended') AS feed_ended, COUNTIF(item_status IS NULL) AS feed_unknown, COUNT(*) AS feed_models FROM ${T('bs_core.dim_product_group')}`,
   dimMap: `SELECT product_group_id AS id, category, broad_category, section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
   dimMapBasic: `SELECT product_group_id AS id, category, '' AS broad_category, '' AS section, primary_url AS url FROM ${T('bs_core.dim_product_group')}`,
   seasonality: `SELECT section, month_of_year, idx, months_covered, peak_ratio, yearly_views FROM ${T('bs_marts.category_seasonality')}`,
@@ -427,6 +434,9 @@ SELECT step, status, message, CAST(finished_at AS STRING) AS finished FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY step ORDER BY finished_at DESC) AS rn FROM ${T('gsc_marts.build_log')}
 ) WHERE rn = 1 ORDER BY step`
 };
+SQL.gapBasic = SQL.gap.replace('  g.item_status AS item_status,\n  g.item_status_source AS item_status_source,\n', '');
+SQL.productsBasic = SQL.products.replace(', in_stock_share, item_status\nFROM', ', in_stock_share\nFROM');
+
 
 /* ---------- segments and rules ---------- */
 const SEGMENTS = [
@@ -485,7 +495,7 @@ const SEG = Object.fromEntries(SEGMENTS.map(s => [s.key, s]));
 const RULES = {
   PDP_MERCH_REVIEW: 'Product page review', CHECKOUT_STEP_BREAK: 'Checkout step dropped', CHECKOUT_FORM_ERRORS: 'Checkout form errors',
   HIDDEN_GEM: 'Hidden gem', STORE_BESTSELLER_GAP: 'Store bestseller under-indexing',
-  PDP_OUT_OF_STOCK: 'Popular page, nothing in stock', DEVICE_GAP: 'Mobile checkout converts less', SEARCH_CONVERTS: 'Site search is under-used',
+  PDP_ENDED_LIVE: 'Ended product still on the site', PDP_OUT_OF_STOCK: 'Popular page, nothing in stock', DEVICE_GAP: 'Mobile checkout converts less', SEARCH_CONVERTS: 'Site search is under-used',
   SHOP_WASTED_SPEND: 'Shopping spend with no sales', SHOP_OOS_SPEND: 'Shopping spend on out-of-stock items', SHOP_SCALE: 'Shopping product to scale', SHOP_STORE_NO_ADS: 'Store bestseller missing from Shopping', SEO_CTR: 'Rewrite title and meta', SEO_DROP: 'Organic visibility drop'
 };
 const PLAYBOOK = {
@@ -516,6 +526,11 @@ const PLAYBOOK = {
     why: 'The demand is proven in store, so the gap is the size of the online opportunity.',
     steps: ['Open Store gap and find this product to see which group it is in and why.', 'Follow the steps for that group: add it, make it findable, fix the page or push traffic.'],
     done: 'Its online share of sales moves towards that of similar products.'},
+  PDP_ENDED_LIVE: {
+    means: 'Business Central shows every item for this product as ended, yet it is still live on the website and the feed lists it as in stock.',
+    why: 'Visitors can find a product nobody can buy, and Shopping and search may still send them to it. It makes the site look out of date.',
+    steps: ['Confirm with Product and Range that the product has ended.', 'Check the live page: is anything really in stock?', 'Remove the page or redirect it to the nearest current product.', 'Make sure the feed stock status is right, so Shopping stops advertising it.'],
+    done: 'The page is gone or redirected, and visits move to a current product.'},
   PDP_OUT_OF_STOCK: {
     means: 'This product page is among the busier ones, but no variant shows as in stock in the feed.',
     why: 'Visitors arrive wanting to buy and cannot. Without a next step they leave for a competitor.',
@@ -620,6 +635,7 @@ const GLOSSARY = [
   ['Online vs similar', 'How a product\u2019s online share of sales compares with similar products. 100% means the same share; 50% means half.'],
   ['Worth a week', 'Estimated weekly sales at stake if a problem continues or a fix works. Search alerts price clicks at your organic revenue per visit.'],
   ['Confirmed alert', 'An alert that has shown on two days in a row. Urgent alerts show straight away.'],
+  ['Item status', 'From Business Central. Current: available for specials or actively ordered for stock. Selling off (DISCSTOCK or clearance): discontinued once stock sells out. Ended: no stock left and no longer available to special order.'],
   ['Set aside', 'An item the dashboard leaves out of the numbers because it is expected, for example garden furniture out of season. It is always listed with the reason and never hidden.'],
   ['Hidden gem', 'A page that earns at least one and a half times the typical revenue per visit for its type, but gets below-median traffic.'],
   ['Leaky bucket', 'A busy page that earns less than half the typical revenue per visit for its type.'],
@@ -786,7 +802,7 @@ function showGate(message){
 async function loadAll(){
   state.loading = true; state.errors = {}; Object.keys(cache).forEach(k => delete cache[k]); renderStatus();
   $('#gate').hidden = true; showView(state.view);
-  const jobs = {rows: bq(SQL.gap), period: bq(SQL.period), weekly: bq(SQL.weekly), built: bq(SQL.buildTime)};
+  const jobs = {rows: bq(SQL.gap).catch(() => bq(SQL.gapBasic)), period: bq(SQL.period), weekly: bq(SQL.weekly), built: bq(SQL.buildTime)};
   const keys = Object.keys(jobs);
   const results = await Promise.allSettled(keys.map(k => jobs[k]));
   const out = {}; let authFailed = false;
@@ -865,8 +881,12 @@ const DEFAULT_RULES = [
   {name: 'Boracay range', type: 'seasonal', match: 'boracay', months: '3-9',
    note: 'Boracay appears to be part of the garden range. Confirm this and edit the row in context.csv.'}
 ];
-const CTX = {rules: [], source: 'built-in', dim: new Map(), pathDim: new Map(), season: new Map(), dimErr: null, seasonErr: null, seasonMonths: 0};
+const CTX = {status: new Map(), statusErr: null, rules: [], source: 'built-in', dim: new Map(), pathDim: new Map(), season: new Map(), dimErr: null, seasonErr: null, seasonMonths: 0};
 
+const STATUS_RULES = {
+  ended: {name: 'Ended in Business Central', type: 'discontinued', tokens: [], months: [], note: 'No stock left and no longer available to special order.'},
+  selling: {name: 'Selling off in Business Central', type: 'discontinued', tokens: [], months: [], note: 'Discontinued once stock sells out, so it is not worth a new page.'}
+};
 function parseMonths(t){
   const out = new Set();
   String(t || '').split(',').forEach(part => {
@@ -913,6 +933,10 @@ async function loadContext(){
     CTX.dim = new Map(rows.map(r => [r.id, r])); CTX.pathDim = new Map(rows.filter(r => r.url).map(r => [r.url, r])); CTX.dimErr = null;
   } catch(e) { CTX.dimErr = e && e.message ? e.message : String(e); }
   try {
+    const rows = await bq(SQL.modelStatus);
+    CTX.status = new Map(rows.map(r => [r.id, r])); CTX.statusErr = null;
+  } catch(e) { CTX.statusErr = e && e.message ? e.message : String(e); CTX.status = new Map(); }
+  try {
     const rows = await bq(SQL.seasonality), by = new Map();
     rows.forEach(r => { const o = by.get(r.section) || {section: r.section, idx: Array(13).fill(null), months: r.months_covered, peak: r.peak_ratio, views: r.yearly_views}; o.idx[r.month_of_year] = r.idx; by.set(r.section, o); });
     CTX.season = new Map([...by.entries()].filter(([, o]) => o.months >= 12 && o.peak >= 3 && o.views >= 5000));
@@ -932,20 +956,26 @@ function nextInSeason(ms){
   return '';
 }
 /* does an item (a product, page or term) fall under a rule? it = {id, name, category, path} */
-function ctxMatch(it){
+function ctxInfo(it){
   const name = (it.name || '').toLowerCase(), cat = (it.category || '').toLowerCase(), path = (it.path || '').toLowerCase(), id = (it.id || '').toUpperCase();
   const d = (it.id && CTX.dim.get(it.id)) || (path && CTX.pathDim.get(path)) || null;
-  const sec = ((d && d.section) || '').toLowerCase(), dcat = ((d && d.category) || '').toLowerCase();
+  return {name, cat, path, id, d, sec: ((d && d.section) || '').toLowerCase(), dcat: ((d && d.category) || '').toLowerCase()};
+}
+function tokenHit(t, c){
+  if(t.startsWith('section:')) return c.sec === t.slice(8);
+  if(t.startsWith('code:')) return c.id.startsWith(t.slice(5).toUpperCase());
+  if(t.startsWith('path:')) return c.path.startsWith(t.slice(5));
+  if(c.d) return c.sec.includes(t) || c.dcat.includes(t);            // known product: judge by its category, not its name
+  return c.name.includes(t) || c.cat.includes(t) || c.path.includes(t);
+}
+function ctxMatch(it){
+  const c = ctxInfo(it), d = c.d;
+  const sid = it.id || (d && d.id), srow = !it.noStatus && sid ? CTX.status.get(sid) : null;
+  if(srow && srow.item_status === 'Ended') return STATUS_RULES.ended;
+  if(srow && srow.item_status === 'Selling off' && it.segment === '1 Not listed online') return STATUS_RULES.selling;
   for(const r of CTX.rules){
-    for(const t of r.tokens){
-      let hit = false;
-      if(t.startsWith('section:')) hit = sec === t.slice(8);
-      else if(t.startsWith('code:')) hit = id.startsWith(t.slice(5).toUpperCase());
-      else if(t.startsWith('path:')) hit = path.startsWith(t.slice(5));
-      else if(d) hit = sec.includes(t) || dcat.includes(t);          // known product: judge by its category, not its name
-      else hit = name.includes(t) || cat.includes(t) || path.includes(t);
-      if(hit) return r;
-    }
+    if(r.type === 'note') continue;
+    for(const t of r.tokens) if(tokenHit(t, c)) return r;
   }
   if(d && d.section){
     const s = CTX.season.get(d.section);
@@ -953,7 +983,17 @@ function ctxMatch(it){
   }
   return null;
 }
+/* a person's comment on a product (type note): shown beside it, never hides it */
+function ctxNote(it){
+  const c = ctxInfo(it);
+  for(const r of CTX.rules){
+    if(r.type !== 'note') continue;
+    for(const t of r.tokens) if(tokenHit(t, c)) return r.note || r.name;
+  }
+  return '';
+}
 function ctxState(rule){
+  if(rule.type === 'note') return {expected: false, text: rule.note};
   if(rule.type === 'seasonal'){
     const m = new Date().getMonth() + 1;
     if(rule.learned){
@@ -971,6 +1011,8 @@ function ctxSplit(list, itemFn){
   (list || []).forEach(r => { const c = ctxFor(itemFn(r)); r.ctx = c; (c ? aside : keep).push(r); });
   return {keep, aside};
 }
+const noteTag = r => r && r.noteText ? '<span class="notetxt">Note: ' + esc(r.noteText) + '</span>' : '';
+const statusTag = r => r && r.statusCheck ? ' <span class="pill check" title="' + esc(r.statusCheck) + '">! Check range status</span>' : '';
 const asideTag = r => r && r.ctx ? ' <span class="pill aside" title="' + esc(r.ctx.text) + '">\u21B7 Set aside: ' + esc(r.ctx.rule) + '</span>' : '';
 function asideNote(items, labelFn, what){
   if(!items || !items.length) return '';
@@ -997,8 +1039,16 @@ function ctxShopData(d){
 }
 function setRows(rows){
   state.allRows = rows;
-  const x = ctxSplit(rows, r => ({id: r.id, name: r.name, category: r.category, path: r.url}));
+  const x = ctxSplit(rows, r => ({id: r.id, name: r.name, category: r.category, path: r.url, segment: r.segment}));
   state.rows = x.keep; state.asideRows = x.aside;
+  const listLoaded = CTX.status.size > 0;
+  state.rows.forEach(r => {
+    r.statusCheck = '';
+    r.noteText = ctxNote({id: r.id, name: r.name, category: r.category, path: r.url});
+    if(r.noteText || !listLoaded || r.segment !== '1 Not listed online') return;
+    if(r.item_status_source === 'range name') r.statusCheck = 'Business Central items named like this are ' + (r.item_status === 'Ended' ? 'all ended' : r.item_status === 'Selling off' ? 'being sold off' : r.item_status === 'Current' ? 'current' : 'a mix of statuses') + '. Confirm this product is still current range.';
+    else if(!r.item_status) r.statusCheck = 'Not found in Business Central. Confirm this product is still current range.';
+  });
 }
 function asideSummary(){
   const a = state.asideRows || []; if(!a.length) return null;
@@ -1267,12 +1317,13 @@ function drawWeekly(){
 }
 
 /* ---------- store gap ---------- */
-function explainRow(r){
+function explainRow(r){ const x = explainRowBase(r); return r.noteText ? Object.assign({}, x, {why: x.why + ' Note: ' + r.noteText}) : x; }
+function explainRowBase(r){
   const per = periodText().months, su = int(r.store_units), sr = r.store_revenue ? gbp(r.store_revenue) + ' ex-VAT' : null;
   const peer = r.peer_web_share != null ? pct(r.peer_web_share, 0) : null;
   switch(r.segment){
     case '1 Not listed online':
-      return {why: 'Sold ' + su + ' in store' + (sr ? ' (' + sr + ')' : '') + ' over ' + per + ' and the website has no page for it, so online sales are zero. Similar products sell ' + (peer ? peer + ' of their units' : 'a good share') + ' online. At that rate this product would add about ' + gbp(r.opportunity) + ' ex-VAT over ' + per + '.',
+      return {why: 'Sold ' + su + ' in store' + (sr ? ' (' + sr + ')' : '') + ' over ' + per + ' and the website has no page for it, so online sales are zero. Similar products sell ' + (peer ? peer + ' of their units' : 'a good share') + ' online. At that rate this product would add about ' + gbp(r.opportunity) + ' ex-VAT over ' + per + '.' + (r.item_status === 'Current' && r.item_status_source === 'code' ? ' Business Central shows it as current.' : (r.statusCheck ? ' ' + r.statusCheck : '')),
               next: 'Check it is a current range and not store-only, then ask Product and Range for images, dimensions, options, lead time and price. Build the page and add it to the feed.'};
     case '2 Listed, undiscovered': {
       const exp = r.peer_views_per_unit ? Math.round(r.peer_views_per_unit * ((r.store_units || 0) + (r.web_units || 0))) : null;
@@ -1356,7 +1407,7 @@ function renderTable(){
   if(!rows.length){ host.innerHTML = '<div class="tablewrap"><p class="empty">No products match. Clear the search or choose another category.</p></div>'; return; }
   const cell = (r, c) => {
     switch(c.key){
-      case 'name': return (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>' + asideTag(r) + (r.segment !== 'OK' ? whyButton('p:' + r.id, state.open.has('p:' + r.id) ? 'Hide explanation' : 'Why is this here?') : '');
+      case 'name': return (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>' + asideTag(r) + statusTag(r) + noteTag(r) + (r.segment !== 'OK' ? whyButton('p:' + r.id, state.open.has('p:' + r.id) ? 'Hide explanation' : 'Why is this here?') : '');
       case 'category': return esc(r.category);
       case 'store_revenue': return gbp(r.store_revenue);
       case 'share_index': return r.share_index == null ? '\u2013' : int(r.share_index) + '%';
@@ -1405,7 +1456,7 @@ function actionRowsAll(d){
   return d.alerts.concat(d.seo).map(r => {
     const o = {...r, gbp: r.est_gbp_week != null ? r.est_gbp_week : (r.est_clicks_week != null && d.rps ? r.est_clicks_week * d.rps : null), confirmed: r.run_count >= 2 || r.priority === 'P1'};
     const isPath = String(r.entity_name).startsWith('/');
-    const c = ctxFor({id: isPath ? '' : r.entity_id, name: r.entity_name, path: isPath ? r.entity_name : ''});
+    const c = ctxFor({id: isPath ? '' : r.entity_id, name: r.entity_name, path: isPath ? r.entity_name : '', noStatus: r.rule_code === 'PDP_ENDED_LIVE'});
     o.category = catOf({id: isPath ? '' : r.entity_id, path: isPath ? r.entity_name : ''}) || catGuess(r.entity_name);
     if(c){ o.aside = true; o.ctx = c; }
     return o;
@@ -1502,7 +1553,7 @@ function renderShopping(el, d0){
       sm ? int(sm.clicks) + ' clicks and ' + int(sm.conversions) + ' conversions from ' + dmy(sm.ws) + ' to ' + dmy(sm.we) + '. These are Google\u2019s own conversions, so they will not match GA4 or Ometria exactly.' : '') +
     sec('Spend with no sales', gbpK(sum(wasted.map(r => r.cost))) + ' across ' + wasted.length + ' ' + plural(wasted.length, 'product', 'products') + ' that took at least \u00A3100 and sold nothing. Check the price, stock and page first, then exclude or cut the bid.',
       tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend', num: true, get: r => '<span class="money">' + gbp(r.cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.clicks)}, {label: 'Impressions', num: true, get: r => int(r.impressions)}, {label: 'Sold in store', num: true, title: 'Units over the store sales period', get: r => r.store_units == null ? '\u2013' : int(r.store_units)}], wasted, {limit: 15, empty: 'No product has taken \u00A3100 without a sale.'})) +
-    (outSeason.length ? sec('Out-of-season products still spending', gbpK(outSeason.reduce((t, r) => t + r.cost, 0)) + ' on ' + outSeason.length + ' out-of-season ' + plural(outSeason.length, 'product', 'products') + '. Low sales are expected, so these are not faults. The question is whether the ads should be paused or cut until the season returns.',
+    (outSeason.length ? sec('Set-aside products still spending', gbpK(outSeason.reduce((t, r) => t + r.cost, 0)) + ' on ' + outSeason.length + ' set-aside ' + plural(outSeason.length, 'product', 'products') + ' (out of season, ended or being sold off). Low sales are expected, so these are not faults. The question is whether the ads should be paused or cut, until the season returns or for good.',
       tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend', num: true, get: r => '<span class="money">' + gbp(r.cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.clicks)}, {label: 'Sales', num: true, get: r => gbp(r.conv_value)}, {label: 'Why it is expected', get: r => esc(r.ctx.text), cls: 'wide'}], outSeason, {limit: 10})) : '') +
     sec('Spend on out-of-stock items', gbpK(sum(oos.map(r => r.oos_cost))) + ' of clicks on items the feed shows as out of stock. Take them out of Shopping until they are back.',
       tbl([{label: 'Product', get: link, cls: 'name'}, {label: 'Spend on out-of-stock', num: true, get: r => '<span class="money">' + gbp(r.oos_cost) + '</span>'}, {label: 'Clicks', num: true, get: r => int(r.oos_clicks)}, {label: 'Total spend', num: true, get: r => gbp(r.cost)}], oos, {limit: 15, empty: 'Almost no spend goes to out-of-stock items.'})) +
@@ -1590,7 +1641,7 @@ function renderLists(el, d){
 
 /* ---------- product pages ---------- */
 async function loadProducts(){
-  const rs = await Promise.allSettled([bq(SQL.products), bq(SQL.seeStore)]);
+  const rs = await Promise.allSettled([bq(SQL.products).catch(() => bq(SQL.productsBasic)), bq(SQL.seeStore)]);
   failIfAuth(rs);
   if(rs[0].status === 'rejected') throw rs[0].reason;
   return {rows: rs[0].value, store: val(rs[1]) || [], storeErr: rs[1].status === 'rejected' ? rs[1].reason : null};
@@ -1599,6 +1650,7 @@ function renderProducts(el, d0){
   const d = ctxProductsData(d0);
   const rows = d.rows;
   const flagged = rows.filter(r => r.merch_review), sum = flagged.reduce((t, r) => t + (r.est_gbp_week || 0), 0);
+  const endedLive = (d.allRows || rows).filter(r => r.item_status === 'Ended' && r.in_stock_share > 0 && r.pdp_sessions >= 100).sort((a, b) => b.pdp_sessions - a.pdp_sessions);
   const noStock = rows.filter(r => r.in_stock_share === 0 && r.pdp_sessions >= 200).sort((a, b) => b.pdp_sessions - a.pdp_sessions);
   const q = state.pp.q.trim().toLowerCase();
   const list = rows.filter(r => (!state.pp.flagged || r.merch_review) && (!q || (r.name || '').toLowerCase().includes(q) || r.id.toLowerCase().includes(q)));
@@ -1609,6 +1661,8 @@ function renderProducts(el, d0){
          {label: 'Worth a week', num: true, title: 'Estimated weekly sales if the page added to basket at the category median', get: r => r.est_gbp_week ? '<span class="money">' + gbp(r.est_gbp_week) + '</span>' : '\u2013'}, {label: 'Category', get: r => esc(r.category)}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)},
          {label: 'Add to basket', num: true, title: 'Share of visits that added the product to their basket', get: r => pct(r.cart_rate)}, {label: 'Category median', num: true, title: 'The typical add-to-basket rate for pages in the same category', get: r => pct(r.peer_median_cart_rate)}], list, {limit: 40, empty: 'No products match.'}) +
     asideNote(d.aside, r => r.name, 'product pages') +
+    (endedLive.length ? sec('Ended products still on the website', endedLive.length + ' ' + plural(endedLive.length, 'product that', 'products that') + ' Business Central shows as ended ' + plural(endedLive.length, 'is', 'are') + ' still live and listed as in stock, with ' + int(endedLive.reduce((t, r) => t + r.pdp_sessions, 0)) + ' visits in 28 days. Confirm, then remove the page or redirect it to the nearest current product.',
+      tbl([{label: 'Product', get: r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>', cls: 'name'}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)}, {label: 'Category', get: r => esc(r.category)}], endedLive, {limit: 15})) : '') +
     (noStock.length ? sec('Popular pages with nothing in stock', noStock.length + ' ' + plural(noStock.length, 'page gets', 'pages get') + ' at least 200 visits in 28 days, with no variant in stock in the feed. Add a back-in-stock sign-up and show alternatives, or redirect if it is not coming back. Check the live page first, because the feed file can differ from the site.',
       tbl([{label: 'Product', get: r => (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>', cls: 'name'}, {label: 'Visits', num: true, get: r => int(r.pdp_sessions)}, {label: 'Category', get: r => esc(r.category)}], noStock, {limit: 15})) : '') +
     findInStore(d, d.allRows) +
@@ -1726,12 +1780,12 @@ const PILL = {good: '\u2713 Good', check: '! Check', fix: '\u2715 Fix'};
 const pill = (level, text) => '<span class="pill ' + level + '">' + PILL[level] + (text ? ' \u2013 ' + esc(text) : '') + '</span>';
 async function loadHealth(){
   const keys = ['ordersLatest','ga4Latest','feed','mapped','tracking','buildLog'];
-  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge), bq(SQL.shopSummary)]);
+  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge), bq(SQL.shopSummary), bq(SQL.statusMeta), bq(SQL.statusCover)]);
   failIfAuth(rs);
-  const labels = ['Ometria orders', 'GA4 export', 'Product feed', 'Store products matching', 'Website tracking', 'Main build log', 'Search Console build log', 'GA4 order capture', 'GA4 order capture by week', 'Product feed age', 'Google Ads matching'];
+  const labels = ['Ometria orders', 'GA4 export', 'Product feed', 'Store products matching', 'Website tracking', 'Main build log', 'Search Console build log', 'GA4 order capture', 'GA4 order capture by week', 'Product feed age', 'Google Ads matching', 'Item status list', 'Item status coverage'];
   const failed = rs.map((r, i) => r.status === 'rejected' ? {label: labels[i] || ('Check ' + i), msg: r.reason && r.reason.message ? r.reason.message : String(r.reason)} : null).filter(Boolean);
   const v = i => val(rs[i]);
-  return {failed, ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0]};
+  return {failed, ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0], statusMeta: v(11) && v(11)[0], statusCover: v(12) && v(12)[0]};
 }
 function renderHealth(el, h){
   const fresh = (label, latest, okDays, warnDays, note) => {
@@ -1748,7 +1802,8 @@ function renderHealth(el, h){
     fresh('Ometria orders', h.ordersLatest, 8, 14, 'Reload orders_full weekly.') +
     fresh('Store sales by product', state.period && state.period.end_date, 8, 14, 'Append the last complete week each week.') +
     fresh('GA4 export', h.ga4Latest, 2, 4, 'The daily export lands the next morning.') +
-    (h.feedLoaded ? fresh('Product feed table', h.feedLoaded, 7, 21, 'Reload the feed so new products are included.') : '') + '</tbody></table></div>');
+    (h.feedLoaded ? fresh('Product feed table', h.feedLoaded, 7, 21, 'Reload the feed so new products are included.') : '') +
+    (h.statusMeta && h.statusMeta.loaded_on ? fresh('Item status list', h.statusMeta.loaded_on, 8, 15, 'Upload the Business Central item list each week.') : '') + '</tbody></table></div>');
   if(h.capture && h.capture.raw_capture != null){
     const wk4 = (h.captureWk || []).slice(-4), cr0 = h.capture.raw_capture, cr = wk4.length ? wk4.reduce((t, r) => t + r.ga4_orders, 0) / Math.max(1, wk4.reduce((t, r) => t + r.ometria_orders, 0)) : cr0, cl = cr >= 0.95 ? 'good' : cr >= 0.85 ? 'check' : 'fix';
     html += sec('Does GA4 record every online order?', 'GA4 recorded ' + (100 * cr0).toFixed(0) + '% of the online orders in Ometria from ' + dmy(h.capture.ws) + ' to ' + dmy(h.capture.we) + ', and ' + (100 * cr).toFixed(0) + '% over the last four weeks. Online units on Store gap are scaled up to allow for the rest (by ' + (100 * (1 / h.capture.factor_applied - 1)).toFixed(0) + '%). Conversion figures from GA4 are not scaled.',
@@ -1763,6 +1818,19 @@ function renderHealth(el, h){
       '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Shopping spend matched to a feed product</td><td class="num">' + (100 * sh).toFixed(1) + '%</td><td>' + pill(shl) + '</td></tr></tbody></table></div>');
   }
   html += contextHealth();
+  if(h.statusMeta){
+    const c = h.statusCover || {}, sc = c.store_cover;
+    const rows = [
+      ['Items in the status list', int(h.statusMeta.items), h.statusMeta.items > 0 ? 'good' : 'fix', 'From the Business Central item list.'],
+      ['Store sales matched to a status', sc != null ? pct(sc, 0) : '\u2013', sc == null ? 'check' : sc >= 0.9 ? 'good' : 'check', 'Made-to-order configurations do not match by code. Those are checked by range name and marked for a human check.'],
+      ['Feed products: current', int(c.feed_current), 'good', ''],
+      ['Feed products: selling off', int(c.feed_selling_off), 'good', 'Discontinued once stock sells out.'],
+      ['Feed products: ended', int(c.feed_ended), c.feed_ended > 0 ? 'check' : 'good', 'Ended products still on the site are listed on Product pages.'],
+      ['Feed products: not in Business Central', int(c.feed_unknown), c.feed_unknown / (c.feed_models || 1) > 0.1 ? 'check' : 'good', '']
+    ];
+    html += sec('Does every product have a status?', 'Business Central says which products are current, selling off or ended. Ended products are set aside everywhere, and products being sold off are not suggested for a new page.',
+      tbl([{label: 'Check', get: r => esc(r[0])}, {label: 'Result', num: true, get: r => esc(String(r[1]))}, {label: 'Status', get: r => pill(r[2])}, {label: 'Note', get: r => esc(r[3]), cls: 'name'}], rows, {limit: 8}));
+  }
   const m = h.mapped, ml = m == null ? 'fix' : m >= 0.95 ? 'good' : m >= 0.9 ? 'check' : 'fix';
   html += sec('Do store products match the website?', 'The share of store sales that lands on a product model in the feed. The opportunity list is reliable from 95%.',
     '<div class="tablewrap"><table><thead><tr><th>Check</th><th class="num">Result</th><th>Status</th></tr></thead><tbody><tr><td>Store sales matched to a model in the feed</td><td class="num">' + (m == null ? '\u2013' : (100 * m).toFixed(1) + '%') + '</td><td>' + pill(ml) + '</td></tr></tbody></table></div>');
@@ -1817,6 +1885,7 @@ function renderGuide(el){
       ['Ometria orders', 'Order value by channel, online and in store. Reloaded by hand each week.'],
       ['Ometria store products', 'Units and sales by product in the showrooms. Appended by hand each week.'],
       ['Product feed', 'Product names, categories, prices and links from the Feedonomics feed file. Reloaded by hand until automatic delivery is set up.'],
+  ['Business Central item list', 'Whether each product is current, being sold off or ended. Uploaded by hand each week.'],
       ['Search Console', 'Google searches, impressions, clicks and rankings. Updates daily (built overnight).']
     ].map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('') + '</dl></div>') +
     contextGuide() +
@@ -1825,6 +1894,11 @@ function renderGuide(el){
 
 function todoSection(h){
   const t = [];
+  if(h.statusMeta){
+    const age = h.statusMeta.loaded_on ? Math.floor((Date.now() - new Date(h.statusMeta.loaded_on)) / 864e5) : null;
+    if(!h.statusMeta.items) t.push({who: 'Dan', what: 'Upload the Business Central item status list (steps are in the README).', why: 'Without it the dashboard cannot tell which products have ended or are being sold off.'});
+    else if(age != null && age > 15) t.push({who: 'Dan', what: 'Upload this week\u2019s Business Central item status list (the last one is ' + age + ' days old).', why: 'Product statuses change often, so products that have ended since may still be suggested.'});
+  }
   (h.failed || []).forEach(f => t.push({who: 'Dan', what: 'The "' + f.label + '" check could not run, so its section is missing. BigQuery said: ' + String(f.msg).slice(0, 240) + '. Send this message to Claude.', why: 'Until it runs, that part of the page cannot tell you whether the data is healthy.'}));
   (h.buildLog || []).concat(h.gscLog || []).filter(r => r.status !== 'ok').forEach(r => t.push({who: 'Dan', what: 'Build step ' + r.step + ' failed: ' + (r.message || 'no message') + '. Send the message to Claude to fix.', why: 'The tab that uses it will be empty or out of date.'}));
   const age = daysBehind(h.ordersLatest); if(age == null || age > 8) t.push({who: 'Dan', what: 'Reload Ometria orders into BigQuery' + (age != null ? ' (the data is ' + age + ' days old)' : '') + '.', why: 'Weekly sales and the online share are wrong without it.'});
