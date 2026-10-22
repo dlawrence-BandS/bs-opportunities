@@ -295,6 +295,7 @@ WITH titles AS (
 SELECT g.product_group_id AS id,
   g.item_status AS item_status,
   g.item_status_source AS item_status_source,
+  g.magento_state AS magento_state,
   COALESCE(g.product_name, t.store_title) AS name,
   COALESCE(g.category, 'Uncategorised') AS category,
   g.gap_segment AS segment,
@@ -392,7 +393,7 @@ WITH f AS (
          SAFE_CAST(REGEXP_EXTRACT(price, r'[0-9.]+') AS FLOAT64) AS p,
          SAFE_CAST(REGEXP_EXTRACT(sale_price, r'[0-9.]+') AS FLOAT64) AS sp,
          RTRIM(link, '/') AS lk
-  FROM ${T('google_ads_raw.product_feed')}
+  FROM ${T('bs_core.live_feed')}
 )
 SELECT COUNT(*) AS feed_rows, COUNT(DISTINCT mk) AS models,
   (SELECT COUNT(*) FROM (SELECT mk FROM f GROUP BY mk HAVING COUNTIF(pt IS NOT NULL) = 0 AND COUNTIF(p > 0) > 0)) AS no_type_models,
@@ -400,10 +401,12 @@ SELECT COUNT(*) AS feed_rows, COUNT(DISTINCT mk) AS models,
   COUNTIF(p = 0) AS zero_price, COUNTIF(p = 0 AND pt IS NOT NULL) AS zero_price_typed,
   COUNTIF(sp > p) AS sale_above
 FROM f`,
-  feedAge: `SELECT CAST(TIMESTAMP_MILLIS(last_modified_time) AS STRING) AS t FROM ${T('google_ads_raw.__TABLES__')} WHERE table_id = 'product_feed'`,
+  feedAge: `SELECT CAST(TIMESTAMP_MILLIS(last_modified_time) AS STRING) AS t FROM ${T('google_ads_raw.__TABLES__')} WHERE table_id = 'magento_feed'`,
   shopSummary: `SELECT CAST(window_start AS STRING) AS ws, CAST(window_end AS STRING) AS we, impressions, clicks, cost, conversions, conv_value, cost_matched, oos_cost FROM ${T('bs_marts.shopping_summary_28d')}`,
   shopModels: `SELECT product_group_id AS id, product_name AS name, category, primary_url AS url, impressions, clicks, cost, conversions, conv_value, roas, oos_clicks, oos_cost, store_units, gap_segment FROM ${T('bs_marts.shopping_by_model_28d')} ORDER BY cost DESC LIMIT 3000`,
   shopGaps: `SELECT product_group_id AS id, product_name AS name, store_units, store_revenue, gap_segment, shopping_impressions FROM ${T('bs_marts.shopping_store_gaps_28d')} ORDER BY store_revenue DESC LIMIT 100`,
+  liveCover: `SELECT (SELECT COUNT(*) FROM ${T('google_ads_raw.magento_feed')}) AS rows_all, (SELECT COUNTIF(status = '1') FROM ${T('google_ads_raw.magento_feed')}) AS rows_enabled,
+  (SELECT COUNT(*) FROM ${T('bs_core.magento_models')}) AS models_all, (SELECT COUNT(*) FROM ${T('bs_core.dim_product_group')}) AS models_live`,
   modelStatus: `SELECT model_key AS id, item_status, n_items, n_current, n_selling_off, n_ended FROM ${T('bs_core.model_status')}`,
   statusMeta: `SELECT CAST(MAX(loaded_on) AS STRING) AS loaded_on, COUNT(*) AS items FROM ${T('bs_core.item_status')}`,
   statusCover: `SELECT (SELECT SAFE_DIVIDE(SUM(IF(ms.model_key IS NOT NULL, s.revenue_ex_vat, 0)), SUM(s.revenue_ex_vat)) FROM ${T('ometria.store_product_sales')} AS s LEFT JOIN ${T('bs_core.model_status')} AS ms ON ms.model_key = ${T('bs_core.model_key')}(s.sku)) AS store_cover,
@@ -434,7 +437,7 @@ SELECT step, status, message, CAST(finished_at AS STRING) AS finished FROM (
   SELECT *, ROW_NUMBER() OVER (PARTITION BY step ORDER BY finished_at DESC) AS rn FROM ${T('gsc_marts.build_log')}
 ) WHERE rn = 1 ORDER BY step`
 };
-SQL.gapBasic = SQL.gap.replace('  g.item_status AS item_status,\n  g.item_status_source AS item_status_source,\n', '');
+SQL.gapBasic = SQL.gap.replace('  g.item_status AS item_status,\n  g.item_status_source AS item_status_source,\n  g.magento_state AS magento_state,\n', '');
 SQL.productsBasic = SQL.products.replace(', in_stock_share, item_status\nFROM', ', in_stock_share\nFROM');
 
 
@@ -1012,6 +1015,7 @@ function ctxSplit(list, itemFn){
   return {keep, aside};
 }
 const noteTag = r => r && r.noteText ? '<span class="notetxt">Note: ' + esc(r.noteText) + '</span>' : '';
+const liveTag = r => r && r.magento_state === 'In Magento, not live' ? ' <span class="pill good" title="It exists in Magento but is disabled or hidden, so it may only need enabling.">\u2713 In Magento, not live</span>' : '';
 const statusTag = r => r && r.statusCheck ? ' <span class="pill check" title="' + esc(r.statusCheck) + '">! Check range status</span>' : '';
 const asideTag = r => r && r.ctx ? ' <span class="pill aside" title="' + esc(r.ctx.text) + '">\u21B7 Set aside: ' + esc(r.ctx.rule) + '</span>' : '';
 function asideNote(items, labelFn, what){
@@ -1323,8 +1327,8 @@ function explainRowBase(r){
   const peer = r.peer_web_share != null ? pct(r.peer_web_share, 0) : null;
   switch(r.segment){
     case '1 Not listed online':
-      return {why: 'Sold ' + su + ' in store' + (sr ? ' (' + sr + ')' : '') + ' over ' + per + ' and the website has no page for it, so online sales are zero. Similar products sell ' + (peer ? peer + ' of their units' : 'a good share') + ' online. At that rate this product would add about ' + gbp(r.opportunity) + ' ex-VAT over ' + per + '.' + (r.item_status === 'Current' && r.item_status_source === 'code' ? ' Business Central shows it as current.' : (r.statusCheck ? ' ' + r.statusCheck : '')),
-              next: 'Check it is a current range and not store-only, then ask Product and Range for images, dimensions, options, lead time and price. Build the page and add it to the feed.'};
+      return {why: 'Sold ' + su + ' in store' + (sr ? ' (' + sr + ')' : '') + ' over ' + per + ' and the website has no live page for it' + (r.magento_state === 'In Magento, not live' ? ' (it exists in Magento but is disabled or hidden, so customers cannot buy it online)' : '') + ', so online sales are zero. Similar products sell ' + (peer ? peer + ' of their units' : 'a good share') + ' online. At that rate this product would add about ' + gbp(r.opportunity) + ' ex-VAT over ' + per + '.' + (r.item_status === 'Current' && r.item_status_source === 'code' ? ' Business Central shows it as current.' : (r.statusCheck ? ' ' + r.statusCheck : '')),
+              next: r.magento_state === 'In Magento, not live' ? 'Check it is a current range, then ask Product and Range why it is not live. If it should be, check the images, price and lead time in Magento and enable it. No new page needs building.' : 'Check it is a current range and not store-only, then ask Product and Range for images, dimensions, options, lead time and price. Build the page and add it to the feed.'};
     case '2 Listed, undiscovered': {
       const exp = r.peer_views_per_unit ? Math.round(r.peer_views_per_unit * ((r.store_units || 0) + (r.web_units || 0))) : null;
       return {why: 'Only ' + int(r.visits) + ' people viewed its page' + (exp ? ', where similar products with this many sales get about ' + int(exp) : '') + '. It sold ' + int(r.web_units) + ' online against ' + su + ' in store, so customers who would buy it are probably not finding it.',
@@ -1407,7 +1411,7 @@ function renderTable(){
   if(!rows.length){ host.innerHTML = '<div class="tablewrap"><p class="empty">No products match. Clear the search or choose another category.</p></div>'; return; }
   const cell = (r, c) => {
     switch(c.key){
-      case 'name': return (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>' + asideTag(r) + statusTag(r) + noteTag(r) + (r.segment !== 'OK' ? whyButton('p:' + r.id, state.open.has('p:' + r.id) ? 'Hide explanation' : 'Why is this here?') : '');
+      case 'name': return (r.url && r.url !== '/' ? '<a href="' + esc(CONFIG.SITE + r.url) + '" target="_blank" rel="noopener">' + esc(r.name) + '</a>' : esc(r.name)) + '<small>' + esc(r.id) + '</small>' + asideTag(r) + liveTag(r) + statusTag(r) + noteTag(r) + (r.segment !== 'OK' ? whyButton('p:' + r.id, state.open.has('p:' + r.id) ? 'Hide explanation' : 'Why is this here?') : '');
       case 'category': return esc(r.category);
       case 'store_revenue': return gbp(r.store_revenue);
       case 'share_index': return r.share_index == null ? '\u2013' : int(r.share_index) + '%';
@@ -1780,12 +1784,12 @@ const PILL = {good: '\u2713 Good', check: '! Check', fix: '\u2715 Fix'};
 const pill = (level, text) => '<span class="pill ' + level + '">' + PILL[level] + (text ? ' \u2013 ' + esc(text) : '') + '</span>';
 async function loadHealth(){
   const keys = ['ordersLatest','ga4Latest','feed','mapped','tracking','buildLog'];
-  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge), bq(SQL.shopSummary), bq(SQL.statusMeta), bq(SQL.statusCover)]);
+  const rs = await Promise.allSettled([bq(SQL.ordersLatest), bq(SQL.ga4Latest), bq(SQL.feed), bq(SQL.mapped), bq(SQL.tracking), bq(SQL.buildLog), EU(SQL.gscLog), bq(SQL.capture), bq(SQL.captureWeekly), bq(SQL.feedAge), bq(SQL.shopSummary), bq(SQL.statusMeta), bq(SQL.statusCover), bq(SQL.liveCover)]);
   failIfAuth(rs);
-  const labels = ['Ometria orders', 'GA4 export', 'Product feed', 'Store products matching', 'Website tracking', 'Main build log', 'Search Console build log', 'GA4 order capture', 'GA4 order capture by week', 'Product feed age', 'Google Ads matching', 'Item status list', 'Item status coverage'];
+  const labels = ['Ometria orders', 'GA4 export', 'Product feed', 'Store products matching', 'Website tracking', 'Main build log', 'Search Console build log', 'GA4 order capture', 'GA4 order capture by week', 'Product feed age', 'Google Ads matching', 'Item status list', 'Item status coverage', 'Magento live status'];
   const failed = rs.map((r, i) => r.status === 'rejected' ? {label: labels[i] || ('Check ' + i), msg: r.reason && r.reason.message ? r.reason.message : String(r.reason)} : null).filter(Boolean);
   const v = i => val(rs[i]);
-  return {failed, ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0], statusMeta: v(11) && v(11)[0], statusCover: v(12) && v(12)[0]};
+  return {failed, ordersLatest: v(0) && v(0)[0] && v(0)[0].latest, ga4Latest: v(1) && v(1)[0] && v(1)[0].latest, feed: v(2) && v(2)[0], mapped: v(3) && v(3)[0] && v(3)[0].mapped_share, tracking: v(4), buildLog: v(5), gscLog: v(6), capture: v(7) && v(7)[0], captureWk: v(8), feedLoaded: v(9) && v(9)[0] ? String(v(9)[0].t).slice(0, 10) : null, shop: v(10) && v(10)[0], statusMeta: v(11) && v(11)[0], statusCover: v(12) && v(12)[0], live: v(13) && v(13)[0]};
 }
 function renderHealth(el, h){
   const fresh = (label, latest, okDays, warnDays, note) => {
@@ -1830,6 +1834,16 @@ function renderHealth(el, h){
     ];
     html += sec('Does every product have a status?', 'Business Central says which products are current, selling off or ended. Ended products are set aside everywhere, and products being sold off are not suggested for a new page.',
       tbl([{label: 'Check', get: r => esc(r[0])}, {label: 'Result', num: true, get: r => esc(String(r[1]))}, {label: 'Status', get: r => pill(r[2])}, {label: 'Note', get: r => esc(r[3]), cls: 'name'}], rows, {limit: 8}));
+  }
+  if(h.live){
+    const L = h.live, notLive = L.models_all - L.models_live;
+    const rowsL = [
+      ['Products in Magento', int(L.models_all) + ' models', 'good', 'Every product Feedonomics sends, whether or not it is live. ' + int(L.rows_all) + ' variants, ' + int(L.rows_enabled) + ' of them enabled.'],
+      ['Live on the website', int(L.models_live) + ' models (' + pct(L.models_live / (L.models_all || 1), 0) + ')', L.models_live > 0 ? 'good' : 'fix', 'Enabled, assigned to the website and visible. Only these count as on the website.'],
+      ['In Magento but not live', int(notLive) + ' models', 'good', 'Disabled, hidden or ended. Ones that sell in store and are current are listed on Store gap as ready to enable.']
+    ];
+    html += sec('Which Magento products are live?', 'The feed holds every Magento product, most of them disabled. The dashboard treats only live products as on the website.',
+      tbl([{label: 'Check', get: r => esc(r[0])}, {label: 'Result', get: r => esc(r[1])}, {label: 'Status', get: r => pill(r[2])}, {label: 'Note', get: r => esc(r[3]), cls: 'name'}], rowsL, {limit: 5}));
   }
   const m = h.mapped, ml = m == null ? 'fix' : m >= 0.95 ? 'good' : m >= 0.9 ? 'check' : 'fix';
   html += sec('Do store products match the website?', 'The share of store sales that lands on a product model in the feed. The opportunity list is reliable from 95%.',
@@ -1884,12 +1898,12 @@ function renderGuide(el){
       ['GA4', 'Visits, product views, baskets, checkout steps, searches and orders on the website. Updates daily (built overnight).'],
       ['Ometria orders', 'Order value by channel, online and in store. Reloaded by hand each week.'],
       ['Ometria store products', 'Units and sales by product in the showrooms. Appended by hand each week.'],
-      ['Product feed', 'Product names, categories, prices and links from the Feedonomics feed file. Reloaded by hand until automatic delivery is set up.'],
+      ['Product feed', 'The Magento product feed, sent every morning by Feedonomics. A product counts as on the website only when it is enabled, assigned to the website and visible.'],
   ['Business Central item list', 'Whether each product is current, being sold off or ended. Uploaded by hand each week.'],
       ['Search Console', 'Google searches, impressions, clicks and rankings. Updates daily (built overnight).']
     ].map(r => '<dt>' + esc(r[0]) + '</dt><dd>' + esc(r[1]) + '</dd>').join('') + '</dl></div>') +
     contextGuide() +
-    sec('Things to keep in mind', '', '<div class="panel"><ul class="plain"><li>Estimates rank opportunities. They are not forecasts.</li><li>Store sales cover a recent period (the date range is in the top right). Seasonal products may look stronger or weaker than usual.</li><li>Made-to-order and in-stock products convert differently and the feed cannot separate them yet.</li><li>If something looks wrong, check <b>Data health</b> first.</li></ul></div>');
+    sec('Things to keep in mind', '', '<div class="panel"><ul class="plain"><li>Estimates rank opportunities. They are not forecasts.</li><li>Store sales cover a recent period (the date range is in the top right). Seasonal products may look stronger or weaker than usual.</li><li>Made-to-order and in-stock products convert differently. The feed now carries lead times, but the dashboard does not separate them yet.</li><li>If something looks wrong, check <b>Data health</b> first.</li></ul></div>');
 }
 
 function todoSection(h){
@@ -2112,10 +2126,12 @@ function slideAdd(pres, ctx){
     {label: 'STORE SALES', value: rev ? gbpK(rev) : '\u2013', delta: 'ex-VAT', sub: 'on these products'},
     {label: 'BIGGEST GAP', value: clip(list[0].name, 26), delta: gbp(list[0].opportunity), tone: 'good', sub: 'est. missed sales'}
   ]);
+  const nEnable = list.filter(r => r.magento_state === 'In Magento, not live').length, nBuild = list.length - nEnable;
+  const act3 = nEnable ? {lead: nBuild ? 'Enable ' + nEnable + ' in Magento and build ' + nBuild + ' new ' + plural(nBuild, 'page', 'pages') : 'Enable ' + nEnable + ' in Magento', rest: nBuild ? nEnable + ' already ' + plural(nEnable, 'exists', 'exist') + ' and only ' + plural(nEnable, 'needs', 'need') + ' switching on after checking images, price and lead time.' : 'they already exist, so check images, price and lead time before switching them on.', owner: 'eCommerce'} : {lead: 'Build the pages and add them to the feed', rest: 'so the site and Google Shopping pick them up.', owner: 'eCommerce'};
   const acts = [
     {lead: 'Confirm which are current range and can be delivered', rest: 'Start with ' + list.slice(0, 2).map(r => clip(r.name, 30)).join(' and ') + '. Take off any that should stay in store only.', owner: 'Product and Range'},
     {lead: 'Supply page content', rest: 'images, dimensions, fabric and colour options, lead time and price.', owner: 'Product and Range'},
-    {lead: 'Build the pages and add them to the feed', rest: 'so the site and Google Shopping pick them up.', owner: 'eCommerce'}
+    act3
   ];
   const rows = list.slice(0, maxRows(y + 0.2, acts.length, 0.3));
   const end = pTable(s, y + 0.2, [{label: 'Product', w: 5.0}, {label: 'Sold in store', w: 1.4, align: 'right'}, {label: 'Avg price (ex-VAT)', w: 1.7, align: 'right'}, {label: 'Store sales (ex-VAT)', w: 2.0, align: 'right'}, {label: 'Est. missed sales', w: 2.32, align: 'right'}],
@@ -2341,7 +2357,8 @@ function checklistItems(sel, data, perList){
   const has = id => sel.includes(id);
   if(has('add')){
     segList('1 Not listed online').forEach(r => { const x = explainRow(r);
-      push('Add products to the website', 'Add to website', 'Product', {item: r.name, code: r.id, owner: SEG['1 Not listed online'].owner, worth: gbp(r.opportunity) + ' over ' + per.months, what: 'Confirm it is current range. Supply images, dimensions, options, lead time and price. Build the page and add it to the feed.', evidence: x.why}); });
+      const en = r.magento_state === 'In Magento, not live';
+      push('Add products to the website', en ? 'Enable in Magento' : 'Add to website', 'Product', {item: r.name, code: r.id, owner: SEG['1 Not listed online'].owner, worth: gbp(r.opportunity) + ' over ' + per.months, what: en ? 'Confirm it is current range. It already exists in Magento but is disabled or hidden: check the images, price and lead time, then enable it.' : 'Confirm it is current range. Supply images, dimensions, options, lead time and price. Build the page and add it to the feed.', evidence: x.why}); });
   }
   if(has('groups')){
     ['2 Listed, undiscovered', '3 Viewed, not added', '4 Under-indexing online', '0 Check mapping'].forEach(k => cap(segList(k)).forEach(r => { const x = explainRow(r);
